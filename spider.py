@@ -23,14 +23,52 @@ import ctypes
 from collections import deque
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QRect, QPoint
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QRect, QPoint, QAbstractNativeEventFilter
 from PySide6.QtGui import (QPainter, QColor, QPen, QIcon, QPixmap, QCursor, QFont, QFontMetrics, QAction,
                            QActionGroup, QTransform, QGuiApplication, QPolygonF, QPainterPath)
 from PySide6.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu
 
-from art import (COSTUMES, COSTUME_BY_KEY, HATS, STYLES, crawl_targets, crawl_joints, get_pose, pose_hang, pose_crawl,
-                 pose_point, fk, joint_bends, draw_web_rope,
+import art
+from art import (COSTUMES, COSTUME_BY_KEY, HATS, STYLES, POSES, crawl_targets, crawl_joints, get_pose, pose_hang,
+                 pose_crawl, pose_point, fk, joint_bends, draw_web_rope, side_joints,
                  lerp, lerp_pose, draw_head, draw_spider, draw_web_line, draw_splat, draw_smoke)
+
+
+def get_pose_safe(name, fallback="hang", style="chibi"):
+    """Поза по имени; если art.py её (ещё) не знает — запасная, чтобы ничего не падало."""
+    return get_pose(name if name in POSES else fallback, style)
+
+
+def _draw_fly_fallback(p, t, sx=1.0):
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(40, 36, 30))
+    p.drawEllipse(QPointF(0, 0), 2.2, 1.6)
+    p.setBrush(QColor(255, 255, 255, 110))
+    w = 0.5 + 0.5 * abs(math.sin(t * 60))
+    p.drawEllipse(QPointF(-1.5, -1.6), 2.0, 1.1 * w)
+    p.drawEllipse(QPointF(1.5, -1.6), 2.0, 1.1 * w)
+
+
+def _draw_rain_fallback(p, rect, t, density=0.6):
+    p.setPen(QPen(QColor(190, 200, 220, 90), 1.0))
+    n = int(rect.width() * rect.height() / 2600 * density)
+    for i in range(n):
+        x = rect.left() + ((i * 97) % 1000) / 1000 * rect.width()
+        y = rect.top() + (((i * 61) % 1000) / 1000 * rect.height() + t * 420) % rect.height()
+        p.drawLine(QPointF(x, y), QPointF(x - 2, y + 11))
+
+
+def _draw_lamp_fallback(p, x, y_ground, h, t):
+    p.setPen(QPen(QColor(40, 40, 48), 3.0))
+    p.drawLine(QPointF(x, y_ground), QPointF(x, y_ground - h))
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(255, 220, 140, 150 + int(20 * math.sin(t * 7))))
+    p.drawEllipse(QPointF(x, y_ground - h), 7, 7)
+
+
+draw_fly = getattr(art, "draw_fly", _draw_fly_fallback)
+draw_rain = getattr(art, "draw_rain", _draw_rain_fallback)
+draw_lamp = getattr(art, "draw_lamp", _draw_lamp_fallback)
 
 APP_NAME = "SpiderPal"
 REG_NAME = "SpiderPal"
@@ -44,6 +82,14 @@ DESCENT = 2.4             # с: гости (мем, гитарист) медле
 NOIR_BAND_AFTER = 1.0     # режим Noir: через сколько секунд сидения прилетает гитарист; номер идёт, пока не прервут
 SONG_LINE_EVERY = 6.5     # с: смена фразы песни в облачке
 LONG_PRESS = 0.6          # с: долгое нажатие — паутина цепляется за точку нажатия, паук летит к ней
+FLY_EVERY = (120, 240)    # с: муха у курсора — не чаще раза в 2–4 минуты
+FLY_IDLE = (2.0, 3.0)     # с покоя у курсора, после которых прилетает муха
+STROLL_AFTER = 20.0       # с сидения на окне, после которых паук может прогуляться по кромке
+STROLL_EVERY = (25, 50)   # с между прогулками
+REACT_GAP = 10.0          # с: реакция на Ctrl+S / Ctrl+Z не чаще
+REST_IV = 50              # мс: интервал таймера в полном покое (картинка не меняется — перерисовок нет)
+HOTKEY_ID = 1             # Ctrl+Alt+S — спрятать/показать паука
+WM_HOTKEY = 0x0312
 LYRICS_FILE = "noir_lyrics_ru.txt"
 SWING_PX = (170, 240)     # длина одного маха по горизонтали
 CRAWL_SPEED = 300         # px/с, предел скорости ползания — спокойно добирается, не «телепортируется»
@@ -174,15 +220,35 @@ class Overlay(QWidget):
         g = screen.geometry()
         # на 1 px ниже экрана, чтобы Windows не считал окно «полноэкранным» и не прятал панель задач
         self.geo = QRect(g.x(), g.y(), g.width(), g.height() - 1)
+        self.sg = QRect(g)              # полная геометрия экрана — для проверки полноэкранных окон
+        self.scr = screen
         self.setScreen(screen)
         self.setGeometry(self.geo)
 
     def paintEvent(self, ev):
+        self.buddy.paints += 1
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.translate(-self.geo.x(), -self.geo.y())
-        self.buddy.paint(p)
+        self.buddy.paint(p, self)
         p.end()
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    """Глобальная горячая клавиша (RegisterHotKey): WM_HOTKEY приходит в очередь потока — ловим здесь."""
+
+    def __init__(self, cb):
+        super().__init__()
+        self.cb = cb
+
+    def nativeEventFilter(self, etype, message):
+        try:
+            m = wintypes.MSG.from_address(int(message))
+            if m.message == WM_HOTKEY and m.wParam == HOTKEY_ID:
+                self.cb()
+        except Exception:
+            pass
+        return False, 0
 
 
 # ----------------------------------------------------------------------------- настройки
@@ -193,7 +259,8 @@ def settings_path():
 
 
 DEFAULTS = dict(costume="classic", size=1.0, hat="auto", clickweb=True, sleep=True, meme=True,
-                windows=True, seasonal=True, bubbles=True, double=True, hidden=False, noir_mode=False)
+                windows=True, seasonal=True, bubbles=True, double=True, hidden=False, noir_mode=False,
+                fs_hide=True, fly=True, stroll=True, rain=True, keys=True, buddy=True)
 
 
 def autostart_cmd():
@@ -280,6 +347,10 @@ class Rope:
                         f *= 0.5
                         p[i] = (x1 + dx * f, y1 + dy * f)
                         p[i + 1] = (x2 - dx * f, y2 - dy * f)
+        mv = 0.0                        # сколько сдвинулась нить за шаг (после ограничений): ~0 — улеглась
+        for i in range(1, n):
+            mv = max(mv, abs(p[i][0] - q[i][0]), abs(p[i][1] - q[i][1]))
+        return mv
 
 
 def split_phrases(lines):
@@ -332,15 +403,21 @@ class Buddy:
                 self.s[key] = val
         if self.s["costume"] not in COSTUME_BY_KEY:
             self.s["costume"] = "classic"
+        if self.s.get("hat") not in ("auto", "none") and self.s.get("hat") not in {h[0] for h in HATS}:
+            self.s["hat"] = "auto"
         self.fake_time = fake_time
         self.cursor_fn = self.real_cursor
         vk = 0x02 if user32.GetSystemMetrics(23) else 0x01       # SM_SWAPBUTTON: у левши «левая» — правая
         self.mouse_fn = lambda: bool(user32.GetAsyncKeyState(vk) & 0x8000)
+        self.mbutton_fn = lambda: bool(user32.GetAsyncKeyState(0x04) & 0x8000)          # средняя кнопка (колесо)
+        self.key_fn = lambda vk_: bool(user32.GetAsyncKeyState(vk_) & 0x8001)           # клавиши для Ctrl+S / Ctrl+Z
+        self.paints = 0                  # счётчик paintEvent — замер «ноль перерисовок в покое»
         self.t_start = time.perf_counter()
         self.last = self.t_start
         self.frames = 0
         self.mode_log = deque(maxlen=400)
         self.events = deque(maxlen=400)
+        self.now_dt = self.clock()       # дата-время считается один раз за тик (costume/hat читают отсюда)
 
         cur = self.cursor_fn()
         self.prev_cur = cur
@@ -398,6 +475,33 @@ class Buddy:
         # новые фишки
         self.sit = None                  # dict(hwnd, rect, x) — на каком окне сидит
         self.sit_target = None           # куда ползёт, чтобы сесть
+        self.at = 0.0                    # «часы анимации»: идут только пока картинка живая; в покое стоят
+        self.resting = False             # картинка не меняется — update() не зовём, таймер реже
+        self.prev_sig = None
+        self.rope_still = False          # нить улеглась — шаг Верле пропускаем, пока концы на месте
+        self.rope_ver = 0
+        self.rope_ends = None
+        self.hero_box = None
+        self.prev_side_rects = []
+        self.sit_sw = 1.0                # размах болтания ногами сидя: в покое затухает до 0
+        self.sip = 0.0
+        self.fly = None                  # муха у курсора: dict(phase, x, y, ...)
+        self.fly_idle = random.uniform(*FLY_IDLE)
+        self.next_fly = self.t_start + 120.0
+        self.stroll = None               # прогулка по кромке окна: dict(steps, i, hwnd, rect, x)
+        self.stroll_after = STROLL_AFTER
+        self.stroll_jitter = 20.0
+        self.stroll_force_side = None
+        self.next_stroll = 0.0
+        self.pin = None                  # приколот средней кнопкой: dict(drag, off)
+        self.mb_down = False
+        self.react = None                # реакция на Ctrl+S / Ctrl+Z: dict(pose, until)
+        self.next_react = 0.0
+        self.keys_prev = {}
+        self.fs_hidden = set()           # индексы оверлеев, спрятанных под полноэкранным окном
+        self.last_fs_check = 0.0
+        self.side = None                 # напарник на другом мониторе (Sidekick)
+        self.hk_filter = None
         self.dozing = False
         self.last_win_check = 0.0
         self.dizzy_until = 0.0
@@ -434,6 +538,14 @@ class Buddy:
 
         self.build_tray()
         self.apply_hidden()
+        self.setup_side(self.t_start)
+        if not selftest:                 # глобальная горячая клавиша Ctrl+Alt+S — спрятать/показать
+            self.hk_filter = HotkeyFilter(self.toggle_hidden)
+            app.installNativeEventFilter(self.hk_filter)
+            if not user32.RegisterHotKey(None, HOTKEY_ID, 0x0001 | 0x0002 | 0x4000, 0x53):   # MOD_ALT|MOD_CONTROL|NOREPEAT
+                self.log("hotkey: RegisterHotKey failed (err %d)" % ctypes.GetLastError())
+                self.hide_action.setText(self.hide_action.text() + " (hotkey unavailable)")
+            app.aboutToQuit.connect(lambda: user32.UnregisterHotKey(None, HOTKEY_ID))
 
     # --- свойства
     @property
@@ -500,20 +612,24 @@ class Buddy:
                 return
         os.startfile(path)
 
-    @property
-    def costume(self):
-        """Костюм с учётом праздников и времени суток (если включено в меню)."""
-        if self.noir:
-            return COSTUME_BY_KEY["noir"]
-        if self.s["seasonal"] and not self.noir_look:
-            d = self.clock()
+    def costume_for(self, key):
+        """Костюм тела с ключом key с учётом праздников и времени суток (если включено в меню)."""
+        if self.s["seasonal"] and key != "noir":
+            d = self.now_dt
             if d.month == 12:
                 return COSTUME_BY_KEY["newyear"]
             if d.month == 10 and d.day == 31:
                 return COSTUME_BY_KEY["halloween"]
             if self.period == "night":
                 return COSTUME_BY_KEY["pajama"]
-        return COSTUME_BY_KEY[self.s["costume"]]
+        return COSTUME_BY_KEY[key]
+
+    @property
+    def costume(self):
+        """Костюм героя с учётом праздников и времени суток (если включено в меню)."""
+        if self.noir:
+            return COSTUME_BY_KEY["noir"]
+        return self.costume_for(self.s["costume"])
 
     @property
     def hat(self):
@@ -521,7 +637,7 @@ class Buddy:
         if h == "auto" and self.noir_look:
             return "fedora"
         if h == "auto":
-            d = self.clock()
+            d = self.now_dt
             if d.month == 12:
                 return "santa"
             if d.month == 10 and d.day == 31:
@@ -586,14 +702,20 @@ class Buddy:
         for s in QGuiApplication.screens():
             r = r.united(s.geometry())
         self.vrect = r
-        for o in self.overlays:
-            if not self.s.get("hidden"):
-                o.show()
+        self.fs_hidden = set()
+        self.refresh_visibility()
+        if self.side is not None:        # мониторы поменялись — напарника заново на свободный экран
+            self.side = None
+            self.setup_side(time.perf_counter())
+
+    def refresh_visibility(self):
+        hidden = self.s.get("hidden")
+        for i, o in enumerate(self.overlays):
+            o.setVisible(not hidden and i not in self.fs_hidden)
 
     def apply_hidden(self):
         hidden = self.s.get("hidden")
-        for o in self.overlays:
-            o.setVisible(not hidden)
+        self.refresh_visibility()
         if hidden:
             self.timer.stop()
             self.meme = None
@@ -602,6 +724,37 @@ class Buddy:
         elif not self.timer.isActive():
             self.last = time.perf_counter()
             self.timer.start(8)
+
+    def toggle_hidden(self):
+        """Ctrl+Alt+S: спрятать/показать паука (как пункт меню «Hide the spider»)."""
+        a = getattr(self, "hide_action", None)
+        if a is not None:
+            a.setChecked(not a.isChecked())      # toggled -> set_opt + apply_hidden
+        else:
+            self.set_opt("hidden", not self.s.get("hidden"))
+            self.apply_hidden()
+        self.log("hotkey: hidden=%s" % self.s.get("hidden"))
+
+    def check_fullscreen(self, now):
+        """Активное окно закрывает весь свой монитор (игра, видео) — прячем оверлей этого монитора."""
+        if now - self.last_fs_check < 0.5:
+            return
+        self.last_fs_check = now
+        hidden = set()
+        if self.s["fs_hide"]:
+            h, r = foreground_window()
+            if h and r and user32.GetWindowLongPtrW(ctypes.c_void_p(h), -16) & 0x01000000:   # GWL_STYLE & WS_MAXIMIZE — не fullscreen
+                h = None
+            if h and r:
+                for i, o in enumerate(self.overlays):
+                    g = o.sg
+                    if (r[0] <= g.left() + 1 and r[1] <= g.top() + 1 and r[2] >= g.left() + g.width() - 1
+                            and r[3] >= g.top() + g.height() - 1):
+                        hidden.add(i)
+        if hidden != self.fs_hidden:
+            self.fs_hidden = hidden
+            self.refresh_visibility()
+            self.log("fullscreen: hidden=%s" % sorted(hidden))
 
     # --- трей
     def make_icon(self, c=None):
@@ -676,7 +829,14 @@ class Buddy:
                           ("Three-spiders meme (10 min idle)", "meme"),
                           ("Double every 5 minutes", "double"),
                           ("Speech bubbles", "bubbles"),
-                          ("Holidays and time of day (pajamas, coffee)", "seasonal")]
+                          ("Holidays and time of day (pajamas, coffee)", "seasonal"),
+                          ("Catch flies near the cursor", "fly"),
+                          ("Walk along window edges", "stroll"),
+                          ("React to Ctrl+S / Ctrl+Z", "keys"),
+                          ("Noir: rain and a street lamp at night", "rain"),
+                          ("Hide over fullscreen apps", "fs_hide")]
+        if len(QGuiApplication.screens()) >= 2:
+            toggles.append(("Buddy on the other monitor", "buddy"))
         if not DOUBLE_ENABLED:
             toggles = [t for t in toggles if t[1] != "double"]
         for text, key in toggles:
@@ -688,10 +848,11 @@ class Buddy:
         if DOUBLE_ENABLED:
             m.addAction("Call the double").triggered.connect(lambda: self.start_double(time.perf_counter(), True))
         m.addSeparator()
-        a = m.addAction("Hide the spider")
+        a = m.addAction("Hide the spider (Ctrl+Alt+S)")
         a.setCheckable(True)
         a.setChecked(bool(self.s["hidden"]))
         a.toggled.connect(lambda v: (self.set_opt("hidden", v), self.apply_hidden()))
+        self.hide_action = a
         a = m.addAction("Run with Windows")
         a.setCheckable(True)
         a.setChecked(autostart_get())
@@ -721,6 +882,13 @@ class Buddy:
     def set_opt(self, key, val):
         self.s[key] = val
         self.save()
+        if key == "buddy":
+            if val:
+                self.setup_side(time.perf_counter())
+            else:
+                self.push_rects(self.prev_side_rects)   # стереть напарника
+                self.prev_side_rects = []
+                self.side = None
 
     def set_noir_mode(self, on):
         """Режим Noir: вид Spider-Noir и его поведение; гитарист прилетает, когда он сядет."""
@@ -747,10 +915,11 @@ class Buddy:
         k_mid, k_right = random.sample(others, 2)
         cx, cy = av.center().x(), av.center().y()
         base = cy + H * 0.55
-        figs = [  # порядок — порядок отрисовки: средний дальше всех
-            dict(x=cx, floor=base - H * 0.3, sc=0.82, key=k_mid, mirror=1, view="front", var="mid", delay=0.0),
-            dict(x=cx - H * 0.78, floor=base, sc=1.0, key=mine, mirror=1, view="front", var="left", delay=0.2),
-            dict(x=cx + H * 0.78, floor=base, sc=1.0, key=k_right, mirror=-1, view="front", var="back", delay=0.4),
+        xl, xr = av.left() + av.width() * 0.22, av.left() + av.width() * 0.78
+        figs = [  # порядок — порядок отрисовки: средний дальше всех (меньше и выше); левый боком, правый спиной
+            dict(x=cx, floor=base - H * 0.35, sc=0.8, key=k_mid, mirror=1, view="front", var="mid", delay=0.0),
+            dict(x=xl, floor=base, sc=1.0, key=mine, mirror=1, view="side", var="left", delay=0.2),
+            dict(x=xr, floor=base, sc=1.0, key=k_right, mirror=-1, view="back", var="back", delay=0.4),
         ]
         for f in figs:
             f.update(ph=random.uniform(0, 6), feet=-1e9, hold=1.0, web_u=0.0)
@@ -1042,7 +1211,7 @@ class Buddy:
     def start_crawl(self, now):
         self.end_band(now)
         self.vs = [0.0, 0.0]
-        if self.mode in ("hang", "swing"):
+        if self.mode in ("hang", "swing", "pin"):
             self.retract_rope(now)
         self.set_pivot(self.st["com"])
         self.V = [0.0, 0.0]
@@ -1053,7 +1222,8 @@ class Buddy:
     def start_travel(self, now, G):
         k = self.k
         self.end_band(now)
-        if self.mode in ("hang", "swing"):
+        self.stroll = None
+        if self.mode in ("hang", "swing", "pin"):
             self.retract_rope(now)
         self.set_pivot(self.st["com"])
         if abs(G[0] - self.P[0]) > 30 * k:
@@ -1072,6 +1242,7 @@ class Buddy:
         self.V = [0.0, 0.0]
         self.shooting = False
         self.sit = dict(hwnd=hwnd, rect=rect, x=x, t0=now)
+        self.next_stroll = now + self.stroll_after + random.uniform(0, self.stroll_jitter)
         self.set_mode("sit")
 
     def release(self, now):
@@ -1101,8 +1272,10 @@ class Buddy:
         self.roost = None
         self.end_band(now)
         self.sit_target = None
-        if self.mode == "sit":
-            self.sit = None
+        self.sit = None
+        self.stroll = None
+        if self.mode in ("sit", "pin"):  # приколот — снимаем с кнопки, дальше как с места
+            self.pin = None
             self.set_pivot(self.st["com"])
             self.V = [0.0, -60 * k]
             self.t_air = 0.0
@@ -1163,7 +1336,7 @@ class Buddy:
             else:
                 self.tip[0] += dx / d * step
                 self.tip[1] += dy / d * step
-        if mode == "sit":
+        if mode in ("sit", "pin"):
             V[0] = V[1] = 0.0
             return
         if mode == "crawl":
@@ -1171,6 +1344,8 @@ class Buddy:
             dvx, dvy = (Gc[0] - P[0]) * 3, (Gc[1] - P[1]) * 3
             d = math.hypot(dvx, dvy)
             vmax = CRAWL_SPEED * k * (0.5 if self.noir else 1.0)      # Нуар старый — 150 px/с
+            if self.stroll:
+                vmax *= 0.4                                          # прогулка по кромке — не спеша
             if d > vmax:
                 dvx, dvy = dvx / d * vmax, dvy / d * vmax
             ax, ay = dvx - V[0], dvy - V[1]
@@ -1195,6 +1370,9 @@ class Buddy:
             self.L += max(-rate, min(rate, tgt - self.L))
             V[0] += (G[0] - P[0]) * 6.0 * h
             V[1] += (G[1] - P[1]) * 2.0 * h
+            if self.calm and math.hypot(V[0], V[1]) < 1.0 * k:    # в покое дотягивать микродвижения не надо —
+                V[0] = V[1] = 0.0                                 # герой замирает, и перерисовки кончаются
+                return
         reel = 0.0
         if mode == "swing":
             dx, dy = P[0] - self.A[0], P[1] - self.A[1]
@@ -1239,6 +1417,8 @@ class Buddy:
         self.last = now
         self.frames += 1
         k = self.k
+        if not self.resting:
+            self.at += dt                # часы анимации стоят в покое — картинка замирает и не перерисовывается
 
         cur = self.cursor_fn()
         moved = cur != self.prev_cur
@@ -1246,8 +1426,9 @@ class Buddy:
         self.prev_cur = cur
         idle_before = now - self.last_move
 
-        # время суток
-        period = self.period_of(self.clock())
+        # время суток (datetime.now() — один раз за тик)
+        self.now_dt = self.clock()
+        period = self.period_of(self.now_dt)
         if period != self.period:
             if period == "night" and self.s["seasonal"]:
                 self.say("Evening already... time for pajamas.", now)
@@ -1304,7 +1485,7 @@ class Buddy:
             for pt, mx, my in ((G, 30, 75), (Gc, 40, 45)):
                 pt[0] = min(pt[0], sg.right() - mx * k)
                 pt[1] = min(pt[1], sg.bottom() - my * k)
-        if moved:
+        if moved and not self.stroll:
             self.sit_target = None
         st_ = self.sit_target
         if st_ and self.mode == "crawl":          # ползёт к кромке окна, чтобы сесть
@@ -1318,7 +1499,8 @@ class Buddy:
         # сон: улетает к боковой кромке окна (или экрана) и спит вниз головой, свисая на паутине
         sleep_after = IDLE_SLEEP_NIGHT if self.period == "night" else IDLE_SLEEP
         if (self.s["sleep"] and not self.noir and idle > sleep_after and not self.roost and not self.double
-                and not self.meme and not self.shooting and self.mode in ("hang", "sit", "crawl")):
+                and not self.meme and not self.shooting and self.mode in ("hang", "sit", "crawl")
+                and not self.fly and not self.stroll):
             self.plan_roost(cur)
         if self.roost:
             G = list(self.roost["goal"])
@@ -1335,6 +1517,31 @@ class Buddy:
                 self.start_double(now)
             else:
                 self.next_double = now + 20
+
+        # напарник на другом мониторе: курсор пришёл на его экран — меняемся местами (без перелёта)
+        if (self.side is not None and scr is not None and scr is self.side.screen and self.pin is None
+                and not self.meme and self.screen_at(*self.P) is not self.side.screen):
+            self.swap_with_side(now)
+        # средняя кнопка по пауку — тащим; отпустили — приколот на паутине сверху, курсор ему безразличен
+        mb = self.mbutton_fn()
+        if (mb and not self.mb_down and self.pin is None and not self.meme and self.mode in ("hang", "sit", "crawl")
+                and self.hit_hero(cur)):
+            self.start_pin(now, cur)
+        pn = self.pin
+        if pn is not None and pn["drag"]:
+            if mb:
+                self.P = [cur[0] + pn["off"][0], cur[1] + pn["off"][1]]
+                self.A = [self.P[0], pn["top"]]
+                self.L = max(20.0, self.P[1] - pn["top"])
+            else:
+                pn["drag"] = False
+                self.last_move = now
+                self.log("pin: placed")
+        self.mb_down = mb
+        self.poll_keys(now)
+        self.update_react(now)
+        self.update_fly(now, dt, cur, idle)
+        self.check_fullscreen(now)
 
         # клик -> паутина
         down = self.mouse_fn()
@@ -1362,8 +1569,10 @@ class Buddy:
         # в пределах одного монитора только ползает; махами на паутине — только на другой монитор
         far = scr is not None and self.screen_at(*self.P) is not scr
         dG = math.hypot(G[0] - self.P[0], G[1] - self.P[1])
-        if stretching:
+        if stretching or self.mode == "pin":
             pass
+        elif self.stroll and self.mode == "crawl":
+            self.update_stroll(now)
         elif (self.roost and not self.roost["arrived"] and not self.shooting
               and self.mode in ("hang", "sit", "crawl")):
             ra = self.roost["A"]
@@ -1378,6 +1587,7 @@ class Buddy:
                 self.start_crawl(now)
         elif self.mode == "sit":
             self.watch_window(now, G)       # слезает только по клику на него или если окно закрыли/свернули
+            self.maybe_stroll(now)
         elif self.mode == "crawl":
             if far:
                 self.start_travel(now, G)
@@ -1397,7 +1607,7 @@ class Buddy:
             if ((th > 0.5 and self.V[0] * self.dir > 0) or self.t_swing > 1.3 or (near and th > 0.15)
                     or self.L <= 72 * k):
                 self.release(now)
-        if self.mode == "hang" and not self.shooting and not self.double:
+        if self.mode == "hang" and not self.shooting and not self.double and not self.fly:
             self.try_sit(now, cur, idle)
         if self.mode == "air":
             self.t_air += dt
@@ -1420,25 +1630,314 @@ class Buddy:
         if self.bubble and now - self.bubble["t0"] > self.bubble["dur"]:
             self.bubble = None
         self.orient(dt, now)
-        if self.mode in ("hang", "swing"):
+        if self.mode in ("hang", "swing", "pin"):
             if self.rope is None:
                 self.rope = Rope(self.A, self.P)
-            d = math.hypot(self.P[0] - self.A[0], self.P[1] - self.A[1])
-            self.rope.step(self.A, self.P, max(self.L, d) * 1.015 + 2 * k, dt, 2400 * k)
+                self.rope_still = False
+            ends = (round(self.A[0], 1), round(self.A[1], 1), round(self.P[0], 1), round(self.P[1], 1))
+            if not (self.rope_still and ends == self.rope_ends):     # нить улеглась и концы на месте — не считаем
+                d = math.hypot(self.P[0] - self.A[0], self.P[1] - self.A[1])
+                mv = self.rope.step(self.A, self.P, max(self.L, d) * 1.015 + 2 * k, dt, 2400 * k)
+                self.rope_ver += 1
+                self.rope_still = mv < 0.03 and self.calm
+                self.rope_ends = ends
         else:
             self.rope = None
+            self.rope_still = False
+        if self.side is not None:
+            self.side.update(now, dt)
+        # покой: герой висит/сидит/спит и ничего живого на экране — картинка не меняется, перерисовок нет
+        static = (self.mode in ("hang", "sit", "pin") and not self.shooting and not self.zip
+                  and not self.animated(now) and (self.pin is None or not self.pin["drag"]))
+        sig = self.signature() if static else None
+        self.resting = static and sig == self.prev_sig
+        self.prev_sig = sig
         self.invalidate(now)
 
         # частота кадров: 120 при движении, 30 в покое (висит, спит, сидит, мем стоит) — экономия CPU
-        busy = (self.mode not in ("hang", "sit") or self.shooting or math.hypot(*self.V) > 12 * k
+        busy = (self.mode not in ("hang", "sit", "pin") or self.shooting or math.hypot(*self.V) > 12 * k
                 or self.splats or self.retracts or 0 < self.sleep_f < 1 or self.parts or self.double
-                or now < self.dizzy_until or stretching)
+                or now < self.dizzy_until or stretching or self.fly or (self.pin and self.pin["drag"]))
         # медленный спуск/подъём гостей на паутине (мем, гитарист) — плавно и на 60 к/с
         glide = (self.meme and self.meme["phase"] != "idle") or (self.band and self.band["phase"] != "play")
-        iv = 8 if busy else (16 if glide or (self.noir_look and self.mode != "crawl" and not self.band) else 33)
-        # у Нуара анимированный дым — 60 к/с; во время номера с гитаристом хватает 30 (CPU)
+        side_anim = self.side is not None and self.side.animating
+        if busy:
+            iv = 8
+        elif glide or (self.noir_look and self.mode != "crawl" and not self.band and not self.rain_on()):
+            iv = 16                      # у Нуара анимированный дым — 60 к/с; в номере с гитаристом и дожде — 30
+        elif self.resting and not side_anim:
+            iv = REST_IV                 # полный покой: ни одной перерисовки, тик реже
+        else:
+            iv = 33
         if self.timer.interval() != iv:
             self.timer.setInterval(iv)
+
+    # --- покой без перерисовок
+    def animated(self, now):
+        """Есть ли на экране что-то, что меняется само (не от движения героя): тогда покоя нет."""
+        return bool(self.bubble or self.parts or self.splats or self.retracts or self.meme or self.band
+                    or self.double or self.fly or self.stroll or self.react or now < self.dizzy_until
+                    or now < self.stretch_until or now < self.cough_until or 0 < self.sleep_f < 1
+                    or (self.noir_look and self.mode != "crawl") or self.rain_on() or self.sip > 0
+                    or (self.roost and not self.roost["arrived"]) or self.sit_sw > 0)
+
+    def signature(self):
+        """Дешёвая подпись картинки героя: совпала с прошлой — update() не нужен."""
+        pose = self.pose
+        return (self.mode, round(self.P[0], 1), round(self.P[1], 1), round(self.rot, 1), round(self.flip, 2),
+                tuple(round(v, 1) for key in ("ra", "la", "rl", "ll") for v in pose[key]),
+                pose.get("hr"), pose.get("hl"), pose.get("front"), self.eyes, round(self.sleep_f, 2),
+                round(self.A[0], 1), round(self.A[1], 1), self.rope_ver, self.costume["key"], self.hat,
+                self.dozing, self.s["size"])
+
+    # --- муха у курсора
+    def start_fly(self, now, cur):
+        self.fly = dict(t0=now, phase="circle", cx=cur[0], cy=cur[1], x=cur[0], y=cur[1],
+                        ph=random.uniform(0, 6.28), shot_at=now + random.uniform(1.2, 1.8), hand=None)
+        self.log("fly")
+
+    def update_fly(self, now, dt, cur, idle):
+        """Муха кружит у курсора; паук стреляет в неё паутиной (как по клику), муха прилипает, он подтягивает
+        её к себе — «Gotcha!». Не чаще раза в 2–4 минуты, только в висе и не у Нуара."""
+        k = self.k
+        f = self.fly
+        if f is None:
+            if (self.s["fly"] and not self.noir and self.mode == "hang" and not self.shooting and not self.zip
+                    and self.pin is None and now >= self.next_fly and self.fly_idle <= idle < IDLE_SIT + 2
+                    and not self.meme and not self.roost and not self.double and not self.band and not self.react
+                    and self.sleep_f == 0):
+                self.start_fly(now, cur)
+            return
+        if f["phase"] == "circle":
+            if self.mode != "hang" or self.shooting:          # паук ушёл — муха улетела
+                self.fly = None
+                self.next_fly = now + 60
+                return
+            f["cx"] += (cur[0] - f["cx"]) * min(1.0, dt * 6)
+            f["cy"] += (cur[1] - f["cy"]) * min(1.0, dt * 6)
+            a = f["ph"] + (now - f["t0"]) * 5.5
+            r = 30 * k
+            x_prev = f["x"]
+            f["x"] = f["cx"] + r * math.cos(a) + 4 * k * math.sin(a * 7.3)
+            f["y"] = f["cy"] - 10 * k + r * 0.55 * math.sin(a) + 3 * k * math.cos(a * 5.1)
+            if abs(f["x"] - x_prev) > 0.3:
+                f["dir"] = sign(f["x"] - x_prev)
+            if now >= f["shot_at"]:
+                f["phase"], f["t1"] = "shot", now
+                f["hand"] = self.world(self.J["lh"])
+                f["tip"] = list(f["hand"])
+        elif f["phase"] == "shot":
+            u = min(1.0, (now - f["t1"]) / 0.12)
+            f["tip"] = [lerp(f["hand"][0], f["x"], u), lerp(f["hand"][1], f["y"], u)]
+            if u >= 1:
+                f["phase"], f["t2"] = "stuck", now
+        elif f["phase"] == "stuck":
+            f["tip"] = [f["x"], f["y"]]
+            if now - f["t2"] > 0.35:
+                f["phase"], f["t3"], f["x0"], f["y0"] = "pull", now, f["x"], f["y"]
+        else:  # pull — подтягивает к руке
+            u = min(1.0, (now - f["t3"]) / 0.5)
+            hand = self.world(self.J["lh"])
+            f["x"], f["y"] = lerp(f["x0"], hand[0], smooth(u)), lerp(f["y0"], hand[1], smooth(u))
+            f["tip"] = [f["x"], f["y"]]
+            if u >= 1:
+                self.fly = None
+                self.say("Gotcha!", now)
+                self.log("fly: caught")
+                self.next_fly = now + random.uniform(*FLY_EVERY)
+                self.fly_idle = random.uniform(*FLY_IDLE)
+
+    # --- прогулка по кромкам окна
+    def maybe_stroll(self, now):
+        st = self.sit
+        if (self.s["stroll"] and st and st["hwnd"] and not self.noir and not self.dozing and not self.band
+                and not self.meme and not self.react and self.pin is None and now >= self.next_stroll
+                and now - st["t0"] > self.stroll_after):
+            self.start_stroll(now)
+
+    def start_stroll(self, now):
+        """Сидел долго — встаёт, ползёт по верхней кромке на новое место; иногда спускается по боковой кромке
+        (корпус поперёк, вид со спины, ступни к рамке) на ~100 px и обратно, потом снова садится."""
+        k, s = self.k, self.scale
+        st = self.sit
+        left, top, right, bottom = st["rect"]
+        scr = self.screen_at(st["x"], top + 2) or QGuiApplication.primaryScreen()
+        g = scr.geometry()
+        seat_h = (self.st["hip"][1] + 4 * self.st["hs"] - self.st["com"][1]) * s
+        x_new = st["x"] + random.choice((-1.0, 1.0)) * random.uniform(120, 260) * k
+        x_new = max(left + 40 * k, min(right - 40 * k, x_new))
+        steps = [("top", [x_new, top - seat_h], 0.0)]
+        want_side = self.stroll_force_side if self.stroll_force_side is not None else (random.random() < 0.6)
+        if want_side:
+            side = 1.0 if abs(right - x_new) < abs(x_new - left) else -1.0
+            ex = right if side > 0 else left
+            feet = (self.J["feet"][1] - self.st["com"][1]) * s         # от центра тела до ступней
+            bx = ex + side * feet                                      # тело снаружи рамки, ступни на ней
+            depth = min(100 * k, bottom - top - 40 * k)
+            if g.left() + 30 * k <= bx <= g.right() - 30 * k and depth > 30 * k:
+                steps += [("corner", [bx, top + 12 * k], 90.0 * side), ("down", [bx, top + 12 * k + depth], 90.0 * side),
+                          ("up", [bx, top + 12 * k], 90.0 * side), ("top2", [x_new, top - seat_h], 0.0)]
+        self.stroll = dict(steps=steps, i=0, hwnd=st["hwnd"], rect=st["rect"], x=x_new, chk=now)
+        self.sit = None
+        self.sit_target = None
+        self.vs = [0.0, 0.0]
+        self.set_pivot(self.st["com"])
+        self.V = [0.0, 0.0]
+        self.set_mode("crawl")
+        self.log("stroll: " + ",".join(s_[0] for s_ in steps))
+
+    def update_stroll(self, now):
+        sl = self.stroll
+        k = self.k
+        if now - sl["chk"] > 0.3:                       # окно закрыли/свернули/сдвинули — спрыгнуть
+            sl["chk"] = now
+            r = window_rect(sl["hwnd"])
+            if r is None or max(abs(r[i] - sl["rect"][i]) for i in (0, 1, 2)) > 2:
+                self.stroll = None
+                self.start_travel(now, [self.P[0], self.P[1] + 100 * k])
+                return
+        name, goal, _ = sl["steps"][sl["i"]]
+        self.crawl_goal = goal
+        if math.hypot(goal[0] - self.P[0], goal[1] - self.P[1]) < 6 * k:
+            sl["i"] += 1
+            if sl["i"] >= len(sl["steps"]):
+                self.stroll = None
+                self.start_sit(now, sl["hwnd"], sl["rect"], sl["x"])
+                self.next_stroll = now + random.uniform(*STROLL_EVERY)
+                self.log("stroll: done")
+
+    def stroll_rot(self):
+        """Поворот корпуса на боковой кромке (±90°: ступни к рамке) или None на верхней."""
+        sl = self.stroll
+        if not sl or sl["i"] >= len(sl["steps"]):
+            return None
+        rot = sl["steps"][sl["i"]][2]
+        return rot if rot else None
+
+    # --- булавка (средняя кнопка)
+    def start_pin(self, now, cur):
+        k = self.k
+        self.end_band(now)
+        self.roost = None
+        self.sit = None
+        self.sit_target = None
+        self.stroll = None
+        self.fly = None
+        self.zip = False
+        self.shooting = False
+        if self.mode in ("hang", "swing"):
+            self.retract_rope(now)
+        self.set_pivot(self.J["rh"])
+        scr = self.screen_at(*cur) or self.screen_at(*self.P) or QGuiApplication.primaryScreen()
+        top = float(scr.geometry().top()) + 4
+        self.pin = dict(drag=True, off=(self.P[0] - cur[0], self.P[1] - cur[1]), top=top)
+        self.A = [self.P[0], top]
+        self.L = max(20.0, self.P[1] - top)
+        self.rope = Rope(self.A, self.P)
+        self.rope_still = False
+        self.V = [0.0, 0.0]
+        self.set_mode("pin")
+        self.log("pin: drag")
+
+    # --- Ctrl+S / Ctrl+Z
+    def poll_keys(self, now):
+        if not self.s["keys"]:
+            return
+        ctrl = self.key_fn(0x11)
+        for vk, name in ((0x53, "S"), (0x5A, "Z")):
+            down = ctrl and self.key_fn(vk)
+            was = self.keys_prev.get(vk, False)
+            self.keys_prev[vk] = down
+            if (down and not was and now >= self.next_react and self.mode in ("hang", "sit") and not self.meme
+                    and not self.react and self.sleep_f == 0 and not self.dozing):
+                self.next_react = now + REACT_GAP
+                self.react = dict(pose="thumbs" if name == "S" else "guilty", until=now + 1.5)
+                self.say("Saved!" if name == "S" else "Oops...", now)
+                if self.bubble:
+                    self.bubble["dur"] = 1.6
+                self.log("react: " + name)
+
+    def update_react(self, now):
+        if self.react and (now >= self.react["until"] or self.mode not in ("hang", "sit")):
+            self.react = None
+
+    # --- дождь и фонарь у Нуара ночью
+    def rain_on(self):
+        return (self.noir and self.s["rain"] and self.period == "night" and self.mode in ("sit", "hang", "pin")
+                and not self.meme)
+
+    def rain_rect(self):
+        k = self.k
+        return QRectF(self.P[0] - 150 * k, self.P[1] - 120 * k, 300 * k, 200 * k)
+
+    def lamp_spec(self):
+        """(x, y_ground, h) фонаря на кромке окна, на котором сидит Нуар, или None."""
+        st = self.sit
+        if self.mode != "sit" or not st or not st["hwnd"]:
+            return None
+        k = self.k
+        left, top, right, _ = st["rect"]
+        side = 1.0 if right - st["x"] >= st["x"] - left else -1.0
+        return (st["x"] + side * 85 * k, top, 95 * k)
+
+    # --- напарник на другом мониторе
+    def setup_side(self, now):
+        """Напарник живёт на мониторе без курсора (только если мониторов ≥ 2 и включено в меню)."""
+        screens = QGuiApplication.screens()
+        if not self.s["buddy"] or len(screens) < 2 or self.side is not None:
+            return
+        cur = self.cursor_fn()
+        here = self.screen_at(*cur) or screens[0]
+        free = [s_ for s_ in screens if s_ is not here]
+        if not free:
+            return
+        key = random.choice([c["key"] for c in COSTUMES if c["key"] not in ("noir", self.s["costume"])])
+        self.side = Sidekick(self, free[0], key, None, now)
+
+    def swap_with_side(self, now):
+        """Курсор ушёл на монитор напарника: он становится героем на своём месте (костюм остаётся с телом),
+        а бывший герой — напарником там, где был. Никто никуда не летит."""
+        sd = self.side
+        old_p, old_key = list(self.P), self.s["costume"]
+        old_scr = self.screen_at(*old_p)
+        if old_scr is None or old_scr is sd.screen:      # герой уже на экране напарника (пин, мем) — напарнику
+            free = [s_ for s_ in QGuiApplication.screens() if s_ is not sd.screen]   # любой другой экран
+            old_scr = free[0] if free else None
+        self.end_band(now)
+        self.band = None
+        self.roost = None
+        self.sit = None
+        self.sit_target = None
+        self.stroll = None
+        self.fly = None
+        self.react = None
+        self.zip = False
+        self.shooting = False
+        self.retracts = []
+        self.sleep_f = 0.0
+        self.P, self.A = list(sd.P), list(sd.A)
+        self.L = max(20.0, math.hypot(self.P[0] - self.A[0], self.P[1] - self.A[1]))
+        self.V = [0.0, 0.0]
+        self.vs = [0.0, 0.0]
+        self.trail = 0.0
+        self.rope = Rope(self.A, self.P)
+        self.rope.p, self.rope.q = list(sd.rope.p), list(sd.rope.q)
+        self.rope_still = False
+        self.pose = dict(sd.pose)
+        self.J = fk(self.style, self.pose)
+        self.att = self.J["rh"]
+        self.rot = sd.rot if sd.sleep_f < 0.5 else -12 * sign(sd.flip)   # спящий (sleep_f→0) не вверх ногами
+        self.flip = self.flip_target = sd.flip
+        s = self.scale                   # преобразование — сразу, иначе set_pivot в этом же тике возьмёт старое
+        self.T = (QTransform().translate(self.P[0], self.P[1]).rotate(self.rot).scale(s * self.flip, s)
+                  .translate(-self.att[0], -self.att[1]))
+        self.set_mode("hang")
+        if not self.noir:
+            self.set_costume(sd.key)
+        self.side = Sidekick(self, old_scr, old_key, old_p if old_scr is self.screen_at(*old_p) else None,
+                             now) if old_scr is not None else None
+        self.swap_P = list(self.P)       # для самотеста: где герой оказался в момент обмена
+        self.log("swap")
 
     def plan_roost(self, cur):
         """Место сна: боковая кромка активного окна (верхний угол), а без окна — край экрана. Паук вешается
@@ -1463,7 +1962,8 @@ class Buddy:
         """Пауза > 3 с — переползти на верхнюю кромку активного окна и сесть, свесив ноги. Нуар, если окна нет
         или оно развёрнуто на весь экран, садится посреди экрана."""
         noir = self.noir
-        if (not self.s["windows"] and not noir) or idle < IDLE_SIT or self.meme or self.double or self.roost:
+        if ((not self.s["windows"] and not noir) or idle < IDLE_SIT or self.meme or self.double or self.roost
+                or self.fly or self.pin is not None or self.stroll):
             return False
         if now - self.last_win_check < 0.5:
             return False
@@ -1513,8 +2013,10 @@ class Buddy:
             self.next_quip = now + random.uniform(240, 420)
 
     def parked(self):
-        """Спит или сидит: такого паука не будит движение мыши — только клик по нему или закрытие окна."""
-        return bool(self.roost) or self.mode == "sit" or bool(self.band)
+        """Спит, сидит, гуляет по кромке или приколот: такого паука не будит движение мыши — только клик
+        по нему или закрытие окна."""
+        return (bool(self.roost) or self.mode == "sit" or bool(self.band) or bool(self.stroll)
+                or (self.pin is not None and not self.pin["drag"]))
 
     def hit_hero(self, cur):
         pt = QPointF(*cur)
@@ -1528,7 +2030,13 @@ class Buddy:
         self.last_move = now
         self.end_band(now)
         self.log("wake: click")
-        if self.mode == "sit":
+        if self.stroll:
+            self.stroll = None
+            self.sit_target = None
+        if self.pin is not None:
+            self.pin = None
+            self.start_crawl(now)
+        elif self.mode in ("sit", "crawl"):
             self.start_crawl(now)
 
     def watch_window(self, now, G):
@@ -1559,33 +2067,53 @@ class Buddy:
         f = self.sleep_f * self.sleep_f * (3 - 2 * self.sleep_f)
         coffee = self.s["seasonal"] and self.period == "morning"
         sip = 0.0
-        if coffee:
-            t7 = now % 7.0
+        if coffee:                       # отхлёбывает по часам анимации: в покое часы стоят — пар и кружка замирают
+            t7 = self.at % 7.0
             sip = smooth((t7 - 5.0) / 0.4) - smooth((t7 - 6.3) / 0.4)
+        self.sip = sip
         hang = pose_hang(style, trail, "mug" if coffee else None, sip)
         rate = 14.0
         spin = 0.0
-        if mode in ("hang", "swing"):
+        # болтание ногами сидя затухает за ~1,5 с покоя, чтобы картинка замерла и перерисовки кончились
+        sw_t = 0.0 if (self.calm and now - self.last_move > 1.5 and not self.band) else 1.0
+        self.sit_sw = max(0.0, min(1.0, self.sit_sw + (sw_t - self.sit_sw) * min(1.0, dt * 2.5)))
+        if self.sit_sw < 0.02:
+            self.sit_sw = 0.0
+        if mode in ("hang", "swing", "pin"):
             rope = math.degrees(math.atan2(self.A[0] - self.P[0], max(1.0, self.P[1] - self.A[1])))
             rope = max(-80.0, min(80.0, rope))
-            if mode == "hang":
+            if mode == "pin":            # приколот: висит на паутине сверху, курсор ему безразличен
+                target_pose = get_pose_safe("pin", "hang", style)
+                rot_t = 0.0
+            elif mode == "hang":
                 if abs(self.A[0] - self.P[0]) > 12 * k:
                     self.flip_target = sign(self.A[0] - self.P[0])
                 if self.double and self.double["phase"] == "act":
                     target_pose = self.hero_double_pose(now)
                     self.flip_target = -self.double["side"]
+                elif self.react:         # в висе правая рука держит паутину — жест (палец вверх, «ой») левой
+                    rp = get_pose_safe(self.react["pose"], "hang", style)
+                    target_pose = dict(hang)
+                    target_pose["la"], target_pose["hl"], target_pose["front"] = rp["ra"], rp["hr"], "rl"
+                    target_pose.pop("lafs", None)
                 else:
                     target_pose = lerp_pose(hang, get_pose("sleep", style), f)
+                rot_t = rope - 12 * sgn * (1 - f) + 180 * f      # во сне — вниз головой
             else:
                 self.flip_target = self.dir
                 sw = SWINGS[self.swing_i % len(SWINGS)]
                 target_pose = hang if sw == "hang" else get_pose(sw, style)
-            rot_t = rope - 12 * sgn * (1 - f) + 180 * f      # во сне — вниз головой
+                rot_t = rope - 12 * sgn * (1 - f) + 180 * f
         elif mode == "sit":
             target_pose = get_pose("sit", style)
-            sw = math.sin(now * 3.0) * 14
+            sw = math.sin(now * 3.0) * 14 * self.sit_sw
             target_pose["rl"] = (target_pose["rl"][0], target_pose["rl"][1] + sw)
             target_pose["ll"] = (target_pose["ll"][0], target_pose["ll"][1] - sw)
+            if self.react:
+                rp = get_pose_safe(self.react["pose"], "sit", style)
+                target_pose["ra"], target_pose["la"] = rp["ra"], rp["la"]
+                target_pose["hr"], target_pose["hl"] = rp["hr"], rp["hl"]
+                target_pose["front"] = rp.get("front", "")
             if coffee:
                 target_pose["la"] = hang["la"]
                 target_pose["hl"] = "mug"
@@ -1602,6 +2130,9 @@ class Buddy:
             target_pose = pose_crawl(style)
             self.flip_target = 1.0              # вид со спины: левая рука героя — слева, как в схеме походки
             rot_t = math.degrees(math.atan2(self.vs[0], -self.vs[1])) if sp > 30 * k else self.rot
+            srot = self.stroll_rot()
+            if srot is not None:                # по боковой кромке окна: корпус поперёк, ступни к рамке
+                rot_t = srot
             rate = 9.0
         else:  # air
             vel = math.degrees(math.atan2(self.V[0], -self.V[1]))
@@ -1638,7 +2169,7 @@ class Buddy:
         self.pose = lerp_pose(self.pose, target_pose, min(1.0, dt * 14))
         self.J = fk(style, self.pose)
         com = self.st["com"]
-        if mode in ("hang", "swing"):
+        if mode in ("hang", "swing", "pin"):
             rh, lh = self.J["rh"], self.J["lh"]     # висит на правой руке; во сне держится обеими у пояса
             self.att = (lerp(rh[0], (rh[0] + lh[0]) / 2, f), lerp(rh[1], (rh[1] + lh[1]) / 2, f))
         elif mode == "sit":
@@ -1673,6 +2204,12 @@ class Buddy:
 
     def invalidate(self, now):
         k = self.k
+        side_rects = self.side.rects() if self.side is not None and self.side.changed() else None
+        if self.resting:                 # картинка героя не изменилась — ни одного update()
+            if side_rects is not None:
+                self.push_rects(self.prev_side_rects + side_rects)
+                self.prev_side_rects = side_rects
+            return
         rects = []
         R = 115 * self.scale + 16
         hero = QRectF(self.P[0] - R, self.P[1] - R, 2 * R, 2 * R)
@@ -1685,7 +2222,7 @@ class Buddy:
             rects.append(QRectF(QPointF(min(a[0], b[0]) - m, min(a[1], b[1]) - m),
                                 QPointF(max(a[0], b[0]) + m, max(a[1], b[1]) + 40 * k + m)))
 
-        if self.mode in ("hang", "swing"):
+        if self.mode in ("hang", "swing", "pin"):
             seg(self.A, self.P)
             rects.append(QRectF(self.A[0] - 14 * k, self.A[1] - 6, 28 * k, 26 * k))   # конус крепления
             if self.rope:                                                            # изгиб нити
@@ -1707,7 +2244,9 @@ class Buddy:
         b = self.band
         if b:
             Rb = 150 * self.scale + 16
-            rects.append(QRectF(b["x"] - Rb, b["top"] - 10, 2 * Rb, b["y"] - b["top"] + Rb + 20))
+            rects.append(QRectF(b["x"] - Rb, b["top"] - 10, 2 * Rb, max(b["y"] - b["top"] + Rb + 20, 30 * k)))
+            if "wx" in b:                                                        # конус крепления
+                rects.append(QRectF(b["wx"] - 14 * k, b["top"] - 6, 28 * k, 26 * k))
         for f in self.parts:
             rects.append(QRectF(f["x"] - 40, f["y"] - 40, 80, 80))
         if self.bubble:
@@ -1719,14 +2258,36 @@ class Buddy:
             for f in m["figs"]:
                 sm = m["H"] * f["sc"] / 104
                 y0 = m["top"] if f.get("hold", 0) > 0 else f["feet"] - 150 * sm
-                rects.append(QRectF(f["x"] - 80 * sm, y0 - 4, 160 * sm, f["feet"] + 14 * sm - y0 + 8))
-        for r in self.prev_rects + rects:
+                y1 = max(f["feet"] + 14 * sm, f["floor"] + 11 * sm)      # тень на полу (floor + 3sm ± 7sm)
+                rects.append(QRectF(f["x"] - 80 * sm, y0 - 4, 160 * sm, y1 - y0 + 8))
+        fl = self.fly
+        if fl:
+            rects.append(QRectF(fl["x"] - 22 * k, fl["y"] - 22 * k, 44 * k, 44 * k))
+            if fl["phase"] != "circle":
+                seg(self.world(self.J["lh"]), fl["tip"])
+        if self.rain_on():
+            rects.append(self.rain_rect().adjusted(-6, -6, 6, 14))
+            lamp = self.lamp_spec()
+            if lamp:                     # столб, кронштейн и конус света (до 0,6 h вправо, 0,35 h влево)
+                x, yg, h = lamp
+                rects.append(QRectF(x - 0.45 * h - 8, yg - h - 12, 1.15 * h + 16, h + 24))
+        box = QRectF(hero)
+        for r in rects:
+            box = box.united(r)
+        self.hero_box = box
+        self.push_rects(self.prev_rects + rects)
+        self.prev_rects = rects
+        if side_rects is not None:
+            self.push_rects(self.prev_side_rects + side_rects)
+            self.prev_side_rects = side_rects
+
+    def push_rects(self, rects):
+        for r in rects:
             ri = r.toAlignedRect()
             for o in self.overlays:
                 x = ri.intersected(o.geo)
                 if not x.isEmpty():
                     o.update(x.translated(-o.geo.topLeft()))
-        self.prev_rects = rects
 
     def layout_bubble(self):
         b = self.bubble
@@ -1741,7 +2302,7 @@ class Buddy:
         ay -= 34 * self.scale
         x = ax - w / 2
         y = ay - h - 12
-        scr = self.screen_at(ax, ay) or QGuiApplication.primaryScreen()
+        scr = self.screen_at(ax, ay) or self.screen_at(*self.P) or QGuiApplication.primaryScreen()
         g = scr.geometry()
         x = max(g.left() + 4, min(g.right() - w - 4, x))
         if y < g.top() + 4:
@@ -1749,12 +2310,22 @@ class Buddy:
         return QRectF(x, y, w, h), (ax, ay)
 
     # --- отрисовка
-    def paint(self, p):
+    def paint(self, p, ov=None):
         if self.frames == 0:   # до первого шага физики положение ещё не посчитано
             return
         now = self.last
         k = self.k
         wl = max(1.0, k * 0.85)
+        at = self.at
+        if self.side is not None and (ov is None or self.side.box().intersects(QRectF(ov.geo))):
+            self.side.paint(p, now)
+        if ov is not None and self.hero_box is not None and not self.hero_box.intersects(QRectF(ov.geo)):
+            return                       # герой и всё его — на другом мониторе
+        if self.rain_on():               # Нуар ночью: дождь вокруг и фонарь на кромке окна
+            lamp = self.lamp_spec()
+            if lamp:
+                draw_lamp(p, lamp[0], lamp[1], lamp[2], at)
+            draw_rain(p, self.rain_rect(), at, 0.6)
         if self.meme:
             self.paint_meme(p, now)
         if self.double:
@@ -1766,29 +2337,41 @@ class Buddy:
             draw_web_line(p, QPointF(*a), QPointF(lerp(b[0], a[0], u), lerp(b[1], a[1], u)), wl,
                           alpha=int(255 * (1 - u)))
         P = QPointF(*self.P)
-        if self.mode in ("hang", "swing") and self.rope:
-            draw_web_rope(p, self.rope.p, wl, cone=11 * k, phase=now * 0.7)
+        if self.mode in ("hang", "swing", "pin") and self.rope:
+            draw_web_rope(p, self.rope.p, wl, cone=11 * k, phase=at * 0.7)
         if self.shooting:          # летящая нить чуть провисает
             hw = self.hand_world()
             dx, dy = self.tip[0] - hw[0], self.tip[1] - hw[1]
             sag = 0.05 * math.hypot(dx, dy)
             pts = [(self.tip[0] - dx * i / 8, self.tip[1] - dy * i / 8 + sag * 4 * (i / 8) * (1 - i / 8)) for i in range(9)]
-            draw_web_rope(p, pts, wl, phase=now * 0.7)
+            draw_web_rope(p, pts, wl, phase=at * 0.7)
+        fl = self.fly
+        if fl and fl["phase"] != "circle":           # нить к мухе и клякса на ней
+            lh = self.world(self.J["lh"])
+            draw_web_line(p, QPointF(*lh), QPointF(*fl["tip"]), 0.9)
+            if fl["phase"] != "shot":
+                draw_splat(p, fl["tip"][0], fl["tip"][1], 7 * k, 0.9)
         p.save()
         p.setTransform(self.T, True)
         # ползёт по стене — виден со спины (голова вперёд, лица не видно)
         draw_spider(p, self.costume, self.pose, self.eyes, "top" if self.mode == "crawl" else "front",
-                    style=self.style, hat=self.hat, t=now, J=self.J)
+                    style=self.style, hat=self.hat, t=at, J=self.J)
         if self.noir_look and self.mode != "crawl":
             # дым и огонёк сигареты анимируются каждый кадр (преобразование героя уже применено)
             draw_smoke(p, now, max(0.0, (self.cough_until - now) / 0.9))
         p.restore()
+        if fl:
+            p.save()
+            p.translate(fl["x"], fl["y"])
+            p.scale(2.2 * k * fl.get("dir", 1.0), 2.2 * k)       # муха ~13 px, головой по ходу
+            draw_fly(p, at if fl["phase"] == "circle" else 0.0, 1.0)
+            p.restore()
         if now < self.dizzy_until:
             self.paint_dizzy_stars(p, now)
         if self.sleep_f > 0.95 or getattr(self, "dozing", False):
             hw = self.world(self.head_center())
             for i in range(3):
-                ph = (now * 0.55 + i / 3) % 1.0
+                ph = (at * 0.55 + i / 3) % 1.0
                 x = hw[0] + (24 + 12 * ph + 3 * math.sin(ph * 9)) * k
                 y = hw[1] - (6 + 46 * ph) * k
                 a = math.sin(ph * math.pi)
@@ -1930,7 +2513,8 @@ class Buddy:
                 # на паутине: держится правой рукой, паутина — из кулака вверх, у края экрана расходится конусом
                 ps = lerp_pose(pose, hang, f["hold"])
                 J = fk(style, ps)
-                hand = QPointF(x + J["rh"][0] * sm * f["mirror"], f["feet"] + (J["rh"][1] - 105 + bob) * sm)
+                Jd = side_joints(J) if f["view"] == "side" else J        # вид сбоку рисуется по side_joints
+                hand = QPointF(x + Jd["rh"][0] * sm * f["mirror"], f["feet"] + (Jd["rh"][1] - 105 + bob) * sm)
                 f.setdefault("wx", hand.x())
                 if f["web_u"] > 0:
                     p.restore()
@@ -1980,6 +2564,136 @@ class Buddy:
             p.restore()
 
 
+# ----------------------------------------------------------------------------- напарник на другом мониторе
+class Sidekick:
+    """Напарник в другом костюме на мониторе без курсора: висит спокойно, изредка спит или потягивается.
+    Лёгкий: не ползает и не летает, тело в покое — из кэша; когда курсор приходит на его экран, он и герой
+    меняются местами (Buddy.swap_with_side). Своё положение, поза, костюм, нить."""
+    BOX = QRectF(-62, -40, 124, 152)
+
+    def __init__(self, b, screen, key, P, now):
+        self.b = b
+        self.screen = screen
+        self.key = key
+        g = screen.geometry()
+        k = b.k
+        if P is None:
+            P = [g.center().x() + random.uniform(-0.2, 0.2) * g.width(), g.top() + 4 + 0.38 * g.height()]
+        self.P = [float(P[0]), float(P[1])]
+        self.A = [self.P[0], max(g.top() + 4.0, self.P[1] - 150 * k)]
+        self.rope = Rope(self.A, self.P)
+        self.rope_still = False
+        self.pose = pose_hang(b.style)
+        self.J = fk(b.style, self.pose)
+        self.state = "hang"
+        self.until = 0.0
+        self.next_act = now + random.uniform(30, 90)
+        self.sleep_f = 0.0
+        self.rot = 0.0
+        self.flip = random.choice((-1.0, 1.0))
+        self.T = QTransform()
+        self.animating = True
+        self.sig = None
+        self.prev_sig = None
+        self.cache = {}
+        self.update(now, 0.0)
+
+    def update(self, now, dt):
+        b = self.b
+        k = b.k
+        if self.state == "hang" and now >= self.next_act:
+            self.state = random.choice(("sleep", "stretch", "sleep"))
+            self.until = now + (random.uniform(12, 20) if self.state == "sleep" else 1.8)
+            b.log("side: " + self.state)
+        elif self.state != "hang" and now >= self.until:
+            self.state = "hang"
+            self.next_act = now + random.uniform(40, 120)
+        want = 1.0 if self.state == "sleep" else 0.0
+        self.sleep_f = max(0.0, min(1.0, self.sleep_f + (dt / 0.6 if want else -dt / 0.35)))
+        f = smooth(self.sleep_f)
+        if self.state == "stretch":
+            target = get_pose("stretch", b.style)
+        else:
+            target = lerp_pose(pose_hang(b.style), get_pose("sleep", b.style), f)
+        self.pose = lerp_pose(self.pose, target, min(1.0, dt * 14)) if dt > 0 else target
+        rot_t = -12 * sign(self.flip) * (1 - f) + 180 * f
+        self.rot += wrap180(rot_t - self.rot) * min(1.0, dt * 14)
+        self.J = fk(b.style, self.pose)
+        rh, lh = self.J["rh"], self.J["lh"]
+        att = (lerp(rh[0], (rh[0] + lh[0]) / 2, f), lerp(rh[1], (rh[1] + lh[1]) / 2, f))
+        s = b.scale
+        self.T = (QTransform().translate(self.P[0], self.P[1]).rotate(self.rot).scale(s * self.flip, s)
+                  .translate(-att[0], -att[1]))
+        if not self.rope_still:
+            d = math.hypot(self.P[0] - self.A[0], self.P[1] - self.A[1])
+            mv = self.rope.step(self.A, self.P, d * 1.015 + 2 * k, max(dt, 1 / 120), 2400 * k)
+            self.rope_still = mv < 0.03 and dt > 0
+        pose = self.pose
+        self.sig = (round(self.rot, 1), round(self.sleep_f, 2), self.rope_still, self.state,
+                    tuple(round(v, 1) for key in ("ra", "la", "rl", "ll") for v in pose[key]), b.costume_for(self.key)["key"])
+        self.animating = self.sig != self.prev_sig or not self.rope_still
+
+    def changed(self):
+        ch = self.sig != self.prev_sig or not self.rope_still
+        self.prev_sig = self.sig
+        return ch
+
+    def eyes(self):
+        return "sleep" if self.sleep_f > 0.5 else "open"
+
+    def box(self):
+        k = self.b.k
+        R = 115 * self.b.scale + 16
+        r = QRectF(self.P[0] - R, self.P[1] - R - 30 * k, 2 * R + 50 * k, 2 * R + 30 * k)
+        return r.united(QRectF(min(self.A[0], self.P[0]) - 20 * k, self.A[1] - 8, abs(self.A[0] - self.P[0]) + 40 * k,
+                               self.P[1] - self.A[1] + 20))
+
+    def rects(self):
+        return [self.box()]
+
+    def paint(self, p, now):
+        b = self.b
+        k = b.k
+        wl = max(1.0, k * 0.85)
+        draw_web_rope(p, self.rope.p, wl, cone=11 * k, phase=0.0)
+        c = b.costume_for(self.key)
+        p.save()
+        p.setTransform(self.T, True)
+        if self.animating:
+            draw_spider(p, c, self.pose, self.eyes(), "front", style=b.style, J=self.J)
+        else:                            # поза замерла — тело из кэша
+            dev = p.device()
+            dpr = dev.devicePixelRatioF() if dev is not None else 1.0
+            ck = (c["key"], self.eyes(), self.sig[4], round(b.scale * dpr, 3))
+            pm = self.cache.get(ck)
+            if pm is None:
+                if len(self.cache) > 4:
+                    self.cache.clear()
+                s2 = b.scale * dpr * 1.5
+                pm = QPixmap(int(self.BOX.width() * s2) + 2, int(self.BOX.height() * s2) + 2)
+                pm.fill(Qt.transparent)
+                q = QPainter(pm)
+                q.setRenderHint(QPainter.Antialiasing)
+                q.scale(s2, s2)
+                q.translate(-self.BOX.x(), -self.BOX.y())
+                draw_spider(q, c, self.pose, self.eyes(), "front", style=b.style, J=self.J)
+                q.end()
+                self.cache[ck] = pm
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(self.BOX, pm, QRectF(pm.rect()))
+        p.restore()
+        if self.sleep_f > 0.95:
+            hw = self.T.map(QPointF(0, 29))
+            b.font.setPixelSize(max(6, int(12 * k)))
+            p.setFont(b.font)
+            for i in range(3):
+                x, y = hw.x() + (24 + 12 * i) * k, hw.y() - (6 + 16 * i) * k
+                p.setPen(QColor(0, 0, 0, 120))
+                p.drawText(QPointF(x + 1, y + 1), "z")
+                p.setPen(QColor(255, 255, 255, 255))
+                p.drawText(QPointF(x, y), "z")
+
+
 # ----------------------------------------------------------------------------- самотест
 class PMC(ctypes.Structure):
     _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
@@ -1998,7 +2712,8 @@ def memory_mb():
     return pmc.WorkingSetSize / 2 ** 20, pmc.PeakWorkingSetSize / 2 ** 20, pmc.PagefileUsage / 2 ** 20
 
 
-def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, crawl_demo=False, zip_demo=False):
+def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, crawl_demo=False, zip_demo=False,
+                 features_demo=False):
     """Курсор подменяется виртуальным (реальную мышь пользователя не трогаем):
     0–1 с покой; 1–4 с круг (ползёт); 4.0–5.0 с тряска (головокружение); с 5.0 с покой:
     двойник (вызов на 6 с), сидит на окне, сон, кокон в 24.6 с, мем в 34.6 с; с 38 с движение."""
@@ -2041,7 +2756,7 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
     poll_extra = []
 
     def mark(name):
-        marks[name] = (time.perf_counter(), time.process_time(), b.frames)
+        marks[name] = (time.perf_counter(), time.process_time(), b.frames, b.paints)
 
     def shot(name, at_cursor=False):
         cx, cy = b.cursor_fn()
@@ -2064,7 +2779,32 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
         p.end()
         pm.save(os.path.join(outdir, prefix + name))
         log["events"][prefix + name] = dict(t=round(time.perf_counter() - t0, 2), mode=b.mode,
-                                   at=[round(b.P[0] - g.x()), round(b.P[1] - g.y())])
+                                   at=[round(b.P[0] - g.x()), round(b.P[1] - g.y())], cover=coverage())
+
+    def coverage():
+        """Кадр рисуется в прозрачную картинку; всё непрозрачное должно лежать в грязных прямоугольниках
+        этого кадра (prev_rects) — иначе на экране останутся следы паутины."""
+        from PySide6.QtGui import QImage, QRegion, QBitmap
+        vr = b.vrect
+        im = QImage(vr.width(), vr.height(), QImage.Format_ARGB32_Premultiplied)
+        im.fill(Qt.transparent)
+        q = QPainter(im)
+        q.setRenderHint(QPainter.Antialiasing)
+        q.translate(-vr.x(), -vr.y())
+        b.paint(q, None)
+        q.end()
+        # маска «любой непрозрачный пиксель» (createAlphaMask режет полупрозрачные штрихи дождя и нити)
+        painted = QRegion(QBitmap.fromImage(im.createMaskFromColor(0, Qt.MaskInColor))).translated(vr.x(), vr.y())
+        dirty = QRegion()
+        for r_ in b.prev_rects + b.prev_side_rects:
+            dirty = dirty.united(r_.toAlignedRect())
+        if b.bubble_rect and b.bubble:
+            dirty = dirty.united(b.bubble_rect[0].adjusted(-4, -4, 4, 40).toAlignedRect())
+        over = painted.subtracted(dirty)
+        ob = over.boundingRect()
+        return dict(ok=over.isEmpty(), painted=[painted.boundingRect().x(), painted.boundingRect().y(),
+                                                painted.boundingRect().width(), painted.boundingRect().height()],
+                    overflow=None if over.isEmpty() else [ob.x(), ob.y(), ob.width(), ob.height()])
 
     def check(name):
         o = b.overlays[0]
@@ -2085,12 +2825,13 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
         mark("end")
 
         def seg(a, z):
-            (w0, c0, f0), (w1, c1, f1) = marks[a], marks[z]
-            return dict(fps=round((f1 - f0) / (w1 - w0), 1),
+            (w0, c0, f0, p0), (w1, c1, f1, p1) = marks[a], marks[z]
+            return dict(fps=round((f1 - f0) / (w1 - w0), 1), paints=p1 - p0,
                         cpu_total_pct=round(100 * (c1 - c0) / (w1 - w0) / os.cpu_count(), 2))
 
         for key, (m0, m1) in (("crawl_1_4s", ("a", "b")), ("double_7_14s", ("c", "d")), ("calm_18_24s", ("e", "f")),
-                              ("meme_36_38s", ("g", "h")), ("whole", ("a", "end"))) if not noir_demo else (
+                              ("meme_34_38s", ("g", "h")), ("rest_test", ("r0", "r1")), ("whole", ("a", "end"))
+                              ) if not noir_demo else (
                 ("noir_play1_to_play2", ("c", "e")), ("noir_play2_6s", ("e", "f")), ("whole", ("a", "end"))):
             if m0 in marks and m1 in marks and marks[m1][0] > marks[m0][0]:
                 log[key] = seg(m0, m1)
@@ -2110,8 +2851,9 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
              (18.0, lambda: mark("e")), (20.5, lambda: shot("4_сидит_на_окне.png")), (21.0, move_window),
              (21.25, lambda: shot("4б_окно_сдвинули.png")), (24.0, lambda: mark("f")),
              (32.0, lambda: check("at_32s")),
-             (34.6, lambda: b.start_meme(time.perf_counter())),     # мем по таймеру — через 10 мин, в тесте вызов
-             (36.0, lambda: mark("g")), (38.0, lambda: mark("h")), (38.6, lambda: shot("6_мем.png", True)),
+             (33.0, lambda: b.start_meme(time.perf_counter())),     # мем по таймеру — через 10 мин, в тесте вызов
+             (34.5, lambda: mark("g")), (37.5, lambda: shot("6_мем.png", True)),   # ≥4 с после старта: все стоят
+             (38.0, lambda: mark("h")),                                             # с 38 с курсор движется — уходят
              (40.0, lambda: check("at_40s")), (40.2, finish)]
     if sleep_demo:      # сон: 5 с покоя -> улетает к боковой кромке окна и висит вниз головой
         sched = [(1.0, lambda: mark("a")), (4.0, lambda: shot("s1_до_сна.png")), (5.9, lambda: shot("s2_летит.png")),
@@ -2240,6 +2982,153 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
         poll_extra.append(zip_shots)
         sched = [(1.0, lambda: mark("a")), (3.6, lambda: shot("zip_3_висит_в_точке.png", True)),
                  (3.7, lambda: mark("b")), (3.8, zip_finish)]
+    if features_demo:   # муха, прогулка по кромкам, Ctrl+S/Z, булавка, полноэкранное окно, горячая клавиша,
+        # обмен с напарником на другом мониторе, покой без перерисовок. Все «нажатия» — подменные функции.
+        F = log["features"] = {}
+        st_ = {}
+        keys = {0x11: False, 0x53: False, 0x5A: False}
+        btn = {"m": False, "l": False}
+        cursor = {"pos": (x0, y0)}
+        b.cursor_fn = lambda: cursor["pos"]
+        b.prev_cur = cursor["pos"]
+        b.mouse_fn = lambda: btn["l"]
+        b.mbutton_fn = lambda: btn["m"]
+        b.key_fn = lambda vk_: keys.get(vk_, False)
+        b.next_fly, b.fly_idle = 0.0, 1.5
+        b.stroll_after, b.stroll_jitter, b.stroll_force_side = 1.0, 0.0, True
+        b.s["buddy"] = True
+        b.side = None
+        b.setup_side(time.perf_counter())           # напарник — на экране без (подменного) курсора
+        F["screens"] = len(QGuiApplication.screens())
+        F["side_created"] = b.side is not None
+
+        def now_():
+            return time.perf_counter()
+
+        def once(name, cond, act):
+            watch.append((name, cond, act))
+
+        def hero_pos():
+            w = b.world((0, 40))
+            return (w[0], w[1])
+
+        def stroll_step():
+            sl = b.stroll
+            return sl["steps"][sl["i"]][0] if sl and sl["i"] < len(sl["steps"]) else None
+
+        def ev(what):
+            return [e for e in b.events if e[1] == what]
+        # 1. муха
+        once("fly1", lambda: b.fly and b.fly["phase"] == "circle" and now_() - b.fly["t0"] > 0.8,
+             lambda: shot("f1_муха_кружит.png", True))
+        once("fly2", lambda: b.fly and b.fly["phase"] == "pull", lambda: shot("f2_муха_поймана.png", True))
+        once("fly3", lambda: ev("fly: caught"), lambda: F.update(fly=dict(t=ev("fly")[0][0], caught=ev("fly: caught")[0][0],
+                                                                     gotcha=bool(ev("say: Gotcha!")))))
+        # 2. прогулка по кромкам окна (сел -> через 1 с встал)
+        once("sit", lambda: b.mode == "sit", lambda: st_.update(seat=list(b.P)))
+        once("st1", lambda: stroll_step() == "top" and abs(b.P[0] - st_.get("seat", [1e9])[0]) > 30,
+             lambda: shot("f3_идёт_по_верхней_кромке.png", True))
+        once("st2", lambda: stroll_step() == "down" and abs(b.rot) > 80 and b.P[1] - b.stroll["steps"][1][1][1] > 25,
+             lambda: (shot("f4_по_боковой_кромке.png", True), st_.update(side_rot=round(b.rot, 1), side_P=[round(v) for v in b.P])))
+        once("st3", lambda: ev("stroll: done"),
+             lambda: (F.update(stroll=dict(steps=ev("stroll: top,corner,down,up,top2") and "top,corner,down,up,top2",
+                                           side_rot=st_.get("side_rot"), side_P=st_.get("side_P"),
+                                           rect=[round(v) for v in win["r"]], done_t=ev("stroll: done")[0][0],
+                                           mode=b.mode)), st_.update(phase="keys")))
+        # 3. Ctrl+S / Ctrl+Z
+        once("k1", lambda: st_.get("phase") == "keys" and b.mode == "sit",
+             lambda: (keys.update({0x11: True, 0x53: True}), st_.update(ks=now_())))
+        once("k2", lambda: "ks" in st_ and b.react and b.react["pose"] == "thumbs" and now_() - st_["ks"] > 0.5,
+             lambda: (shot("f5_ctrl_s.png", True), keys.update({0x11: False, 0x53: False}),
+                      F.update(ctrl_s=dict(pose=b.pose["hr"] + "/" + b.pose["hl"], bubble=b.bubble and b.bubble["text"])),
+                      st_.update(kz_at=now_() + 1.8)))
+        once("k3", lambda: "kz_at" in st_ and now_() > st_["kz_at"] and not b.react,
+             lambda: (setattr(b, "next_react", 0.0), keys.update({0x11: True, 0x5A: True}), st_.update(kz=now_())))
+        once("k4", lambda: "kz" in st_ and b.react and b.react["pose"] == "guilty" and now_() - st_["kz"] > 0.5,
+             lambda: (shot("f6_ctrl_z.png", True), keys.update({0x11: False, 0x5A: False}),
+                      F.update(ctrl_z=dict(bubble=b.bubble and b.bubble["text"])),
+                      st_.update(phase="pin", pin_at=now_() + 1.8)))
+        # 4. булавка: средняя кнопка на пауке, тащим, отпускаем; курсор уходит — висит; клик — отпускает
+        ptx, pty = x0 + 350, y0 - 300
+
+        def pin_drag():
+            if "pin_t" in st_ and btn["m"]:
+                u = max(0.0, min(1.0, (now_() - st_["pin_t"] - 0.2) / 0.8))
+                p0 = st_["pin_from"]
+                cursor["pos"] = (lerp(p0[0], ptx, u), lerp(p0[1], pty, u))
+        poll_extra.append(pin_drag)
+        once("p1", lambda: st_.get("phase") == "pin" and now_() > st_["pin_at"],
+             lambda: (cursor.update(pos=hero_pos()), st_.update(pin_t=now_(), pin_from=hero_pos()), btn.update(m=True)))
+        once("p2", lambda: "pin_t" in st_ and now_() - st_["pin_t"] > 1.1,
+             lambda: (btn.update(m=False), st_.update(pin_rel=now_())))
+        once("p3", lambda: "pin_rel" in st_ and now_() - st_["pin_rel"] > 1.0,
+             lambda: (shot("f7_приколот.png", True),
+                      F.update(pin=dict(mode=b.mode, P=[round(v) for v in b.P], target=[ptx, pty], drag_event=bool(ev("pin: drag")),
+                                        anchor=[round(v) for v in b.A])),
+                      st_.update(pinP=list(b.P)), cursor.update(pos=(x0 - 300, y0 + 150)), st_.update(pin_away=now_())))
+        once("p4", lambda: "pin_away" in st_ and now_() - st_["pin_away"] > 1.0,
+             lambda: (F["pin"].update(stays=b.mode == "pin" and math.hypot(b.P[0] - st_["pinP"][0], b.P[1] - st_["pinP"][1]) < 1),
+                      cursor.update(pos=hero_pos()), btn.update(l=True), st_.update(pin_click=now_())))
+        once("p5", lambda: "pin_click" in st_ and now_() - st_["pin_click"] > 0.12, lambda: btn.update(l=False))
+        once("p6", lambda: "pin_click" in st_ and now_() - st_["pin_click"] > 0.6,
+             lambda: (F["pin"].update(after_click_mode=b.mode, unpinned=b.pin is None),
+                      st_.update(phase="fs", fs_at=now_() + 0.3)))
+        # 5. полноэкранное окно (имитация рамки на весь экран) и горячая клавиша
+        def fs_on():
+            g = (b.screen_at(*b.P) or scr).geometry()
+            win["r"] = (g.left(), g.top(), g.left() + g.width(), g.top() + g.height())
+            st_["fs_t"] = now_()
+        once("fs1", lambda: st_.get("phase") == "fs" and now_() > st_["fs_at"], fs_on)
+        once("fs2", lambda: "fs_t" in st_ and now_() - st_["fs_t"] > 0.8,
+             lambda: (F.update(fullscreen=dict(hidden=[not o.isVisible() for o in b.overlays], fs_hidden=sorted(b.fs_hidden))),
+                      win.update(r=(-10000, -10000, -9000, -9000)), st_.update(fs_off=now_())))
+        once("fs3", lambda: "fs_off" in st_ and now_() - st_["fs_off"] > 0.8,
+             lambda: (F["fullscreen"].update(restored=[o.isVisible() for o in b.overlays]), b.toggle_hidden(), st_.update(hk=now_())))
+        once("hk1", lambda: "hk" in st_ and now_() - st_["hk"] > 0.4,
+             lambda: (F.update(hotkey=dict(hidden=b.s["hidden"], overlays_hidden=[not o.isVisible() for o in b.overlays],
+                                           timer_active=b.timer.isActive())), b.toggle_hidden(), st_.update(hk2=now_())))
+        once("hk2", lambda: "hk2" in st_ and now_() - st_["hk2"] > 0.4,
+             lambda: (F["hotkey"].update(restored=(not b.s["hidden"]) and all(o.isVisible() for o in b.overlays)),
+                      st_.update(phase="swap" if b.side else "rest", swap_at=now_() + 0.3, rest_at=now_() + 3.5)))
+        # 6. обмен с напарником: курсор на его монитор — герой там, где был напарник, без перелёта
+        def swap_go():
+            sd = b.side
+            st_.update(side_P=list(sd.P), side_key=sd.key, hero_key=b.s["costume"], hero_P=list(b.P), swap_t=now_(),
+                       other=sd.screen, n_modes=len(b.mode_log))
+            c_ = sd.screen.geometry().center()
+            cursor["pos"] = (float(c_.x()), float(c_.y()))
+        once("sw1", lambda: st_.get("phase") == "swap" and now_() > st_["swap_at"], swap_go)
+
+        def swap_check():
+            sp = st_["side_P"]
+            modes = [m_[1] for m_ in list(b.mode_log)[st_["n_modes"]:]]
+            swp = getattr(b, "swap_P", b.P)
+            F["swap"] = dict(hero_on_other_screen=b.screen_at(*b.P) is st_["other"],
+                             hero_at_side_pos=math.hypot(swp[0] - sp[0], swp[1] - sp[1]) < 2,
+                             costume_follows_body=b.s["costume"] == st_["side_key"] and b.side.key == st_["hero_key"],
+                             side_at_old_hero_pos=b.side is not None and math.hypot(b.side.P[0] - st_["hero_P"][0], b.side.P[1] - st_["hero_P"][1]) < 2,
+                             modes_after=modes, no_flight=not any(m_.startswith("air") or m_ == "swing" for m_ in modes))
+            shot("f8_обмен_мониторов.png", True)
+            cursor["pos"] = (x0, y0)
+            st_["back_t"] = now_()
+        once("sw2", lambda: "swap_t" in st_ and now_() - st_["swap_t"] > 0.6, swap_check)
+        once("sw3", lambda: "back_t" in st_ and now_() - st_["back_t"] > 0.6,
+             lambda: (F["swap"].update(back_on_primary=b.screen_at(*b.P) is scr, back_costume=b.s["costume"] == st_["hero_key"]),
+                      st_.update(phase="rest", rest_at=now_() + 3.5)))
+        # 7. покой: висит у курсора, окна нет — ноль перерисовок
+        def rest_go():
+            k_ = b.k
+            win["r"] = (-10000, -10000, -9000, -9000)
+            b.next_fly = 1e12
+            cursor["pos"] = (b.P[0] - 28 * k_, b.P[1] - 14 * k_)
+            st_["rest0"] = now_()
+        once("r0", lambda: st_.get("phase") == "rest" and now_() > st_["rest_at"] - 3.0, rest_go)
+        once("r1", lambda: "rest0" in st_ and now_() - st_["rest0"] > 4.5, lambda: (mark("r0"), st_.update(rest1=now_())))
+        once("r2", lambda: "rest1" in st_ and now_() - st_["rest1"] > 5.0,
+             lambda: (mark("r1"), F.update(rest=dict(resting=b.resting, interval_ms=b.timer.interval(), mode=b.mode,
+                                                     paints_5s=b.paints - marks["r0"][3])),
+                      shot("f9_покой.png", True), finish()))
+        sched = [(1.0, lambda: mark("a")), (120.0, finish)]
     poll = QTimer(app)
     poll.setTimerType(Qt.PreciseTimer)
 
@@ -2265,11 +3154,12 @@ def main():
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.restype = ctypes.c_void_p
         main.mutex = k32.CreateMutexW(None, False, "Local\\SpiderPal_single_instance")
-        if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS — уже запущен
+        if ctypes.GetLastError() == 183:   # ERROR_ALREADY_EXISTS — уже запущен
             return
     overrides = {}
     if selftest:
         overrides["sleep"] = "--sleep" in argv      # обычный самотест — без сна (уводит паука с окна)
+        overrides["buddy"] = False                  # напарника включает только тест --features (после подмены курсора)
     if "--noir" in argv:
         overrides["noir_mode"] = True
     if "--size" in argv:
@@ -2285,7 +3175,8 @@ def main():
         i = argv.index("--selftest")
         out = argv[i + 1] if len(argv) > i + 1 else os.path.join(app_dir(), "скриншоты")
         prefix = argv[argv.index("--prefix") + 1] if "--prefix" in argv else ""
-        run_selftest(app, b, out, prefix, "--sleep" in argv, "--noir" in argv, "--crawl" in argv, "--zip" in argv)
+        run_selftest(app, b, out, prefix, "--sleep" in argv, "--noir" in argv, "--crawl" in argv, "--zip" in argv,
+                     "--features" in argv)
     app.exec()
 
 

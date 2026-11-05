@@ -5,9 +5,11 @@
 Голова — эллипс 64×58 (≈56 % роста). Голова и торс не зависят от позы и рисуются в кэш-картинки;
 руки, ноги и кисти — каждый кадр.
 Виды: front — спереди; back — со спины (кусочек линзы из-за края головы, для мема); top — со спины
-при ползании по стене (лица не видно).
+при ползании по стене (лица не видно); side — боком, лицом вправо (левые конечности дальние, за торсом).
+Обводка: голова и торс — свои; каждая рука/нога (с кистью или сапогом) — один силуэт, швов между частями нет.
 """
 import math
+from collections import OrderedDict
 
 from PySide6.QtCore import Qt, QPointF, QRectF
 from PySide6.QtGui import (QPainter, QColor, QPen, QPainterPath, QPixmap, QTransform, QPolygonF,
@@ -68,6 +70,7 @@ for _c in COSTUMES:
     q["rimA"] = _alpha(q["rim"], 150)
     q["fold"] = _alpha(mix(q["main"], BLACK, 0.6), 110)      # складки и мышцы
     q["fold2"] = _alpha(mix(q["second"], BLACK, 0.6), 110)
+    q["_key"] = _c["key"]
     _c["q"] = q
 
 
@@ -256,7 +259,8 @@ def fk(style, pose):
     """Прямая кинематика: углы позы -> точки суставов. Длины костей постоянны — руки и ноги не «ломаются»."""
     st = STYLES[style]
     J = {}
-    for s, sx in (("r", 1), ("l", -1)):
+    # lsx=+1 — вид сбоку: левые конечности считаются в той же системе, что правые («наружу» = вперёд)
+    for s, sx in (("r", 1), ("l", pose.get("lsx", -1))):
         shp = (st["sh"][0] * sx, st["sh"][1])
         u, f = pose[s + "a"]
         du, df = _dir(u, sx), _dir(f, sx)
@@ -273,6 +277,24 @@ def fk(style, pose):
         an = (kn[0] + dn[0] * st["sn"], kn[1] + dn[1] * st["sn"])
         J[s + "p"], J[s + "k"], J[s + "n"] = hp, kn, an
     J["feet"] = ((J["rn"][0] + J["ln"][0]) / 2, max(J["rn"][1], J["ln"][1]) + 3.5 * st["hs"])
+    return J
+
+
+SIDE_SH, SIDE_HIP = 3.0, 2.5    # вид сбоку: плечи и бёдра почти на оси (ближнее — чуть впереди)
+
+
+def side_joints(J, style="chibi"):
+    """Скелет для вида сбоку (лицом вправо): плечи в x=±SIDE_SH, бёдра в ±SIDE_HIP, длины конечностей
+    в плоскости картинки сохраняются. Идемпотентна. Нужна логике, чтобы знать, где на экране кисть (J['rh'])."""
+    J = dict(J)
+    for sd, x0, x1 in (("r", SIDE_SH, SIDE_HIP), ("l", -SIDE_SH, -SIDE_HIP)):
+        dx = x0 - J[sd + "s"][0]
+        for n in "sewh":
+            J[sd + n] = (J[sd + n][0] + dx, J[sd + n][1])
+        dx = x1 - J[sd + "p"][0]
+        for n in "pkn":
+            J[sd + n] = (J[sd + n][0] + dx, J[sd + n][1])
+    J["feet"] = ((J["rn"][0] + J["ln"][0]) / 2, J["feet"][1])
     return J
 
 
@@ -308,6 +330,12 @@ POSES = {
     "guitar": _pose(ra=(70, 85), la=(-20, -35), rl=(8, 4), ll=(8, 4), rlfs=0.3, llfs=0.3, hr="fist", hl="fist",
                     front="rl", item="guitar"),
     "pillow": _pose(ra=(115, 140), la=(130, 150), rl=(6, 2), ll=(-4, -2), hl="pillow", front="rl"),
+    # большой палец вверх (гордится): правая согнута, кулак у плеча, вторая вдоль тела
+    "thumbs": _pose(ra=(32, 168), la=(10, 22), rl=(14, 6), ll=(14, 6), hr="thumb", front="r"),
+    # виноватый: ладони раскрыты у лица (плечи поджаты — локти прижаты, кисти вверх)
+    "guilty": _pose(ra=(18, 172), la=(18, 172), rl=(6, 2), ll=(6, 2), hr="shrug", hl="shrug", front="rl"),
+    # пришпилен: висит безвольно на одной руке, вторая и ноги болтаются
+    "pin": _pose(ra=(168, 176), la=(8, 16), rl=(12, -4), ll=(-2, -14), hr="fist", hl="open", front="r"),
 }
 
 
@@ -337,17 +365,23 @@ def pose_crawl(style="chibi"):
 
 
 def pose_point(variant, t, style="chibi"):
-    """Позы мема — как в оригинале: все трое лицом к зрителю, обе руки видны.
-    mid  — средний (сзади) разводит руки: показывает на обоих;
-    left — левый: вытянутая рука показывает через сцену на правого, вторая — кулак на поясе;
-    back — правый: то же зеркально (рисуется с mirror=-1) — показывает на левого."""
+    """Позы мема (трое далеко друг от друга, у каждого свой вид):
+    left — левый, view='side' (стоит боком, лицом вправо): ближняя (правая) рука вытянута вправо на правого,
+           дальняя согнута, кулак на поясе — видна из-за торса (lsx=+1: обе руки в системе «вперёд = +x»);
+    mid  — средний, view='front', дальше всех: разводит руки, показывает на обоих (чуть укорочены — к зрителю);
+    back — правый, view='back', рисуется с mirror=-1: поднятая рука показывает влево на левого, вторая вдоль тела.
+    Во всех позах локти гнутся только в анатомическую сторону (joint_bends > 0)."""
     j = 3.0 * math.sin(t * 8)
     j2 = 3.0 * math.sin(t * 8 + 1.3)
-    legs = dict(rl=(20, 6), ll=(20, 6))
     if variant == "mid":
-        return _pose(ra=(72 + j, 78 + j), la=(72 + j2, 78 + j2), hr="point", hl="point", front="rl", **legs)
-    # вытянутая правая рука (на экране — в сторону соседа), левая — кулак на поясе; обе поверх тела
-    return _pose(ra=(94 + j, 99 + j), la=(52, -88 + j2), hr="point", hl="fist", front="rl", **legs)
+        return _pose(ra=(70 + j, 80 + j), la=(70 + j2, 80 + j2), rl=(20, 6), ll=(20, 6), hr="point", hl="point",
+                     rafs=0.85, lafs=0.85, front="rl")
+    if variant == "back":
+        # поднятая рука (model +x -> после зеркала экранный левый край): к голове соседа; вторая — вдоль тела
+        return _pose(ra=(104 + j, 118 + j), la=(8, 16), rl=(18, 4), ll=(18, 4), hr="point", hl="fist", front="r")
+    # боком: ближняя рука прямо вперёд (+x), дальняя — локоть назад, кулак на бедре; дальняя нога чуть назад
+    return _pose(ra=(92 + j, 98 + j), la=(-50, 40), rl=(14, 4), ll=(-4, -12), hr="point", hl="fist",
+                 front="r", under="l", lsx=1)
 
 
 def _cross(u, v):
@@ -361,16 +395,18 @@ BEND_SIGN = {"ra": -1, "la": 1, "rl": 1, "ll": -1}
 BEND_LIMITS = (4.0, 150.0)       # сгиб сустава, градусы: от «почти прямо» до предела; 0 — неопределённая сторона
 
 
-def joint_bends(J):
-    """Сгиб локтей и колен, градусы: > 0 — в анатомическую сторону, < 0 — обратный выгиб (для самотеста)."""
+def joint_bends(J, pose=None):
+    """Сгиб локтей и колен, градусы: > 0 — в анатомическую сторону, < 0 — обратный выгиб (для самотеста).
+    pose с lsx=+1 (вид сбоку) — левые суставы считаны в системе правых, знак у них зеркальный."""
     out = {}
+    flip = -1 if pose and pose.get("lsx", -1) > 0 else 1
     for key, names in (("ra", ("rs", "re", "rw")), ("la", ("ls", "le", "lw")),
                        ("rl", ("rp", "rk", "rn")), ("ll", ("lp", "lk", "ln"))):
         a, m, b = (J[n] for n in names)
         u = (m[0] - a[0], m[1] - a[1])
         v = (b[0] - m[0], b[1] - m[1])
         ang = math.degrees(math.atan2(_cross(u, v), u[0] * v[0] + u[1] * v[1]))
-        out[key] = ang * BEND_SIGN[key]
+        out[key] = ang * BEND_SIGN[key] * (flip if key[0] == "l" else 1)
     return out
 
 
@@ -443,6 +479,8 @@ def lerp_pose(a, b, f):
     for k in ("rafs", "lafs", "rlfs", "llfs"):      # укорочение возвращается к 1, если в цели его нет
         if k in a and k not in b:
             out[k] = lerp(a[k], 1.0, f)
+    if "lsx" in a and "lsx" not in b:               # система левых конечностей (вид сбоку) не прыгает
+        out["lsx"] = a["lsx"]
     return out
 
 # ----------------------------------------------------------------------------- конечности
@@ -563,16 +601,89 @@ def _band(a, b, pr, t0, t1, sx, side, f0, f1):
     return QPolygonF(p0 + list(reversed(p1)))
 
 
-def draw_limb(p, pts, profs, fills, webs, q, sx, stripe=None, ow=2.6):
-    """Конечность из двух участков (плечо-локоть-запястье или бедро-колено-лодыжка) по профилю мышц.
-    fills: [(участок, t0, t1, цвет)]; webs: [(участок, t0, t1)] — сетка паутины;
-    stripe: (участок, t0, t1, цвет, сторона) — продольная полоса (синяя полоса на руке)."""
-    segs = [(pts[i], pts[i + 1], profs[i]) for i in range(2)]
-    p.setPen(_pen(q["rim"], ow))
-    p.setBrush(q["rim"])
-    for a, b, pr in segs:                                  # общая обводка обоих участков
+def _hand_flip(wrist, el, kind):
+    """Куда смотрит большой палец (локальная ось -y): у раскрытой ладони — к оси тела, иначе — вверх."""
+    dx, dy = wrist[0] - el[0], wrist[1] - el[1]
+    ln = math.hypot(dx, dy) or 1e-6
+    nx, ny = -dy / ln, dx / ln
+    if kind in ("open", "shrug"):
+        return -1 if (-nx) * (-wrist[0]) < 0 else 1
+    return -1 if -ny > 0 else 1
+
+
+def _hand_xform(p, wrist, el, hs, flip):
+    p.translate(*wrist)
+    p.rotate(math.degrees(math.atan2(wrist[1] - el[1], wrist[0] - el[0])))
+    p.scale(hs, hs * flip)
+
+
+def _hand_outline(p, wrist, el, kind, hs, flip):
+    """Силуэт кисти текущим пером/кистью (часть общей обводки конечности)."""
+    shapes, _ = _HANDS["fist" if kind in ("mug", "pillow") else kind]
+    p.save()
+    _hand_xform(p, wrist, el, hs, flip)
+    p.drawRoundedRect(_PALM, 3.6, 3.6)
+    _draw_shapes(p, shapes)
+    p.restore()
+
+
+def _foot_outline(p, ankle, sx, view, hs):
+    """Силуэт сапога текущим пером/кистью."""
+    p.save()
+    p.translate(ankle[0], ankle[1] + 3.5 * hs)
+    p.scale(hs, hs)
+    if view == "front":
+        p.drawEllipse(QPointF(2 * sx, 1.6), 7.0, 4.4)
+        p.drawEllipse(QPointF(1.6 * sx, 0.2), 5.9, 3.2)
+    else:
+        p.drawRoundedRect(QRectF(-4.3, -3.6, 8.6, 7.2), 3.6, 3.4)
+    p.restore()
+
+
+def _limb_silhouette(p, segs, sx, end):
+    """Силуэт всей конечности текущим пером/кистью: оба участка + кисть или стопа — один контур."""
+    for a, b, pr in segs:
         p.drawPath(_seg_path(a, b, pr, 0.0, 1.0, sx))
+    if end and end[0] == "hand":
+        _hand_outline(p, segs[1][1], segs[1][0], end[1], end[2], end[3])
+    elif end and end[0] == "foot":
+        _foot_outline(p, segs[1][1], sx, end[1], end[2])
+
+
+def _foot_details(p, segs, q, sx, view, hs):
+    """Кромка сапога уголком, колено (блик спереди / складка сзади) и сам сапог без обводки."""
+    (kn, an, pr) = segs[1]
+    back = view != "front"
+    bx, by = _pt(kn, an, 0.32)
+    r = pr[0][1]
+    p.setBrush(Qt.NoBrush)
+    p.setPen(_pen(q["rimA"], 0.8 * r / 4.6))
+    p.drawLine(QPointF(bx - r * 0.9, by), QPointF(bx, by + r * (0.35 if back else -0.35)))
+    p.drawLine(QPointF(bx, by + r * (0.35 if back else -0.35)), QPointF(bx + r * 0.9, by))
     p.setPen(Qt.NoPen)
+    if back:
+        p.setPen(_pen(q["fold2"], 0.8 * r / 4.6))
+        p.drawLine(QPointF(kn[0] - r * 0.6, kn[1] + 0.3), QPointF(kn[0] + r * 0.6, kn[1] + 0.3))
+        p.setPen(Qt.NoPen)
+    else:
+        p.setBrush(QColor(255, 255, 255, 55))
+        p.drawEllipse(QPointF(kn[0] - r * 0.15, kn[1] - r * 0.1), r * 0.55, r * 0.45)
+    draw_foot(p, an, sx, q, view, hs, rim=False)
+
+
+FAR_SHADE = 0.22        # затемнение дальней конечности при виде сбоку
+LIMB_CACHE = True       # кэш картинок конечностей (ключ — углы костей с шагом 1°)
+
+
+def _draw_limb_raw(p, pts, profs, fills, webs, q, sx, stripe, ow, end, shade, t):
+    segs = [(pts[i], pts[i + 1], profs[i]) for i in range(2)]
+    if end and end[0] == "hand" and end[1] == "pillow":        # подушка — под кулаком, до обводки
+        wr, el = segs[1][1], segs[1][0]
+        draw_pillow(p, wr, math.degrees(math.atan2(wr[1] - el[1], wr[0] - el[0])), end[2])
+    p.setPen(_pen(q["rim"], ow))                               # проход 1: силуэт всей конечности — одна обводка
+    p.setBrush(q["rim"])
+    _limb_silhouette(p, segs, sx, end)
+    p.setPen(Qt.NoPen)                                         # проход 2: заливки без пера — швов между частями нет
     for i, t0, t1, ck in fills:
         a, b, pr = segs[i]
         p.setBrush(q[ck])
@@ -584,8 +695,8 @@ def draw_limb(p, pts, profs, fills, webs, q, sx, stripe=None, ow=2.6):
         ln = math.hypot(b[0] - a[0], b[1] - a[1]) or 1e-6
         d = t0 * ln + 1.4
         while d < t1 * ln - 0.6:
-            t = d / ln
-            ro, ri = _prof(pr, t)
+            t_ = d / ln
+            ro, ri = _prof(pr, t_)
             x, y = a[0] + ux * d, a[1] + uy * d
             web.moveTo(x + nx * ro * 0.9, y + ny * ro * 0.9)
             web.quadTo(x + ux * (ro + ri) * 0.17, y + uy * (ro + ri) * 0.17, x - nx * ri * 0.9, y - ny * ri * 0.9)
@@ -611,6 +722,49 @@ def draw_limb(p, pts, profs, fills, webs, q, sx, stripe=None, ow=2.6):
         p.drawPolygon(_band(a, b, pr, 0.05, 0.95, sx, sh, 0.35, 0.92))
         p.setBrush(HILITE)
         p.drawPolygon(_band(a, b, pr, 0.1, 0.85, sx, -sh, 0.45, 0.68))
+    if end and end[0] == "hand":
+        draw_hand(p, segs[1][1], segs[1][0], end[1], q, end[2], t, rim=False, flip=end[3])
+    elif end and end[0] == "foot":
+        _foot_details(p, segs, q, sx, end[1], end[2])
+    if shade > 0:                                          # дальняя конечность — в тени торса
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, int(255 * shade)))
+        _limb_silhouette(p, segs, sx, end)
+
+
+def draw_limb(p, pts, profs, fills, webs, q, sx, stripe=None, ow=2.6, end=None, shade=0.0, t=0.0, tag=None):
+    """Конечность из двух участков (плечо-локоть-запястье или бедро-колено-лодыжка) по профилю мышц — ОДНИМ
+    телом: сначала силуэт всех частей (включая кисть/стопу) обводкой, затем заливки без пера.
+    fills: [(участок, t0, t1, цвет)]; webs: [(участок, t0, t1)] — сетка паутины;
+    stripe: (участок, t0, t1, цвет, сторона) — продольная полоса; end: ("hand", вид, hs, flip) или
+    ("foot", вид, hs); shade — затемнение (дальняя конечность); tag — имя для кэша картинок
+    (None — рисовать напрямую; кружка и подушка не кэшируются)."""
+    if not (LIMB_CACHE and tag and not (end and end[0] == "hand" and end[1] in ("mug", "pillow"))):
+        _draw_limb_raw(p, pts, profs, fills, webs, q, sx, stripe, ow, end, shade, t)
+        return
+    root = pts[0]
+    rel, key = [(0.0, 0.0)], []
+    for a, b in ((pts[0], pts[1]), (pts[1], pts[2])):      # кости относительно корня, углы с шагом 1°
+        ang = round(math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])))
+        ln = round(math.hypot(b[0] - a[0], b[1] - a[1]) * 4) / 4
+        r = math.radians(ang)
+        x, y = rel[-1]
+        rel.append((x + ln * math.cos(r), y + ln * math.sin(r)))
+        key += [ang, ln]
+    ext = list(rel)
+    hs = end[2] if end else 1.0
+    if end and end[0] == "hand":
+        dx, dy = rel[2][0] - rel[1][0], rel[2][1] - rel[1][1]
+        ln = math.hypot(dx, dy) or 1e-6
+        ext.append((rel[2][0] + dx / ln * 18 * hs, rel[2][1] + dy / ln * 18 * hs))
+    m = 9.0 * hs + ow
+    xs, ys = [x for x, _ in ext], [y for _, y in ext]
+    box = QRectF(min(xs) - m, min(ys) - m, max(xs) - min(xs) + 2 * m, max(ys) - min(ys) + 2 * m)
+    k = ("limb", tag, q["_key"], sx, tuple(key), end, shade, stripe and (stripe[3], stripe[4]), ow)
+    p.save()
+    p.translate(*root)
+    _cached(p, k, box, lambda qp: _draw_limb_raw(qp, rel, profs, fills, webs, q, sx, stripe, ow, end, shade, t))
+    p.restore()
 
 # кисть в своей системе: x — вперёд от запястья, -y — сторона большого пальца
 def _capsule(a, b, r):
@@ -640,6 +794,26 @@ def _hand_shapes(kind):
         for y in (0.55, 2.55):
             lines.moveTo(6.4, y)
             lines.lineTo(9.2, y)
+    elif kind == "thumb":                                 # кулак, большой палец вытянут вперёд (вверх при поднятой руке)
+        for y in (-1.4, 0.6, 2.5, 4.2):
+            shapes.append(("e", (7.6, y), 1.3))
+        shapes += _capsule((4.0, -3.4), (13.0, -5.2), 1.35)
+        lines.moveTo(10.4, -5.9)
+        lines.lineTo(10.6, -3.8)                          # сустав большого пальца
+        for y in (-0.4, 1.55, 3.4):
+            lines.moveTo(6.2, y)
+            lines.lineTo(8.9, y)
+    elif kind == "shrug":                                 # ладонь раскрыта наружу, пальцы веером шире, большой в сторону
+        for (bx, by), ang, ln in (((6.6, -3.2), -42, 5.6), ((7.6, -1.2), -16, 6.4), ((7.7, 1.0), 10, 6.2),
+                                  ((6.9, 3.0), 34, 5.2)):
+            a = math.radians(ang)
+            shapes += _capsule((bx, by), (bx + ln * math.cos(a), by + ln * math.sin(a)), 1.15)
+        a = math.radians(-84)
+        shapes += _capsule((2.2, -3.6), (2.2 + 5.0 * math.cos(a), -3.6 + 5.0 * math.sin(a)), 1.3)
+        lines.moveTo(2.4, -1.2)                           # линии ладони
+        lines.quadTo(4.6, 0.8, 6.4, 2.8)
+        lines.moveTo(3.0, 2.2)
+        lines.quadTo(4.8, 1.6, 6.2, 0.2)
     else:                                                 # кулак: костяшки и большой палец поперёк
         for y in (-2.9, -0.95, 1.0, 2.95):
             shapes.append(("e", (8.0, y), 1.35))
@@ -650,7 +824,7 @@ def _hand_shapes(kind):
     return shapes, lines
 
 
-_HANDS = {k: _hand_shapes(k) for k in ("open", "point", "fist")}
+_HANDS = {k: _hand_shapes(k) for k in ("open", "point", "fist", "thumb", "shrug")}
 
 
 def _guitar_body():
@@ -757,29 +931,24 @@ def draw_guitar(p, t=0.0):
     p.restore()
 
 
-def draw_hand(p, wrist, el, kind, q, hs=1.0, t=0.0):
-    """Кисть у запястья, направление — по предплечью. kind: fist, point, open, mug (кулак + кружка),
-    pillow (кулак + подушка)."""
+def draw_hand(p, wrist, el, kind, q, hs=1.0, t=0.0, rim=True, flip=None):
+    """Кисть у запястья, направление — по предплечью. kind: fist, point, open, thumb (палец вверх),
+    shrug (ладонь раскрыта наружу), mug (кулак + кружка), pillow (кулак + подушка).
+    rim=False — без собственной обводки (контур уже дан общим силуэтом конечности)."""
+    if flip is None:
+        flip = _hand_flip(wrist, el, kind)
     dx, dy = wrist[0] - el[0], wrist[1] - el[1]
-    ang = math.degrees(math.atan2(dy, dx))
     ln = math.hypot(dx, dy) or 1e-6
-    nx, ny = -dy / ln, dx / ln              # мировое направление локальной оси +y
-    # большой палец (локальный -y): у раскрытой ладони — к оси тела, у кулака и указующей — вверх
-    if kind == "open":
-        flip = -1 if (-nx) * (-wrist[0]) < 0 else 1
-    else:
-        flip = -1 if -ny > 0 else 1
     shapes, lines = _HANDS["fist" if kind in ("mug", "pillow") else kind]
-    if kind == "pillow":
-        draw_pillow(p, wrist, ang, hs)
+    if kind == "pillow" and rim:
+        draw_pillow(p, wrist, math.degrees(math.atan2(dy, dx)), hs)
     p.save()
-    p.translate(*wrist)
-    p.rotate(ang)
-    p.scale(hs, hs * flip)
-    p.setPen(_pen(q["rim"], 2.4))
-    p.setBrush(q["rim"])
-    p.drawRoundedRect(_PALM, 3.6, 3.6)
-    _draw_shapes(p, shapes)
+    _hand_xform(p, wrist, el, hs, flip)
+    if rim:
+        p.setPen(_pen(q["rim"], 2.4))
+        p.setBrush(q["rim"])
+        p.drawRoundedRect(_PALM, 3.6, 3.6)
+        _draw_shapes(p, shapes)
     p.setPen(Qt.NoPen)
     g = QRadialGradient(QPointF(2.5, -2.5), 9)
     g.setColorAt(0, q["mainL"])
@@ -857,8 +1026,9 @@ def draw_pillow(p, wrist, ang, hs):
     p.restore()
 
 
-def draw_foot(p, ankle, sx, q, view="front", hs=1.0):
-    """Сапог. Спереди — носок вперёд, со спины — пятка и подошва (стопа смотрит от зрителя)."""
+def draw_foot(p, ankle, sx, q, view="front", hs=1.0, rim=True):
+    """Сапог. Спереди — носок вперёд, со спины — пятка и подошва (стопа смотрит от зрителя).
+    rim=False — без обводки (контур дан общим силуэтом ноги)."""
     cx, cy = ankle[0], ankle[1] + 3.5 * hs
     p.save()
     p.translate(cx, cy)
@@ -867,9 +1037,10 @@ def draw_foot(p, ankle, sx, q, view="front", hs=1.0):
     g.setColorAt(0, q["mainL"])
     g.setColorAt(0.6, q["main"])
     g.setColorAt(1, q["mainD"])
+    rp = _pen(q["rim"], 1.6) if rim else Qt.NoPen
     if view == "front":
         p.translate(2 * sx, 0)
-        p.setPen(_pen(q["rim"], 1.6))
+        p.setPen(rp)
         p.setBrush(q["mainD"])
         p.drawEllipse(QPointF(0, 1.6), 7.0, 4.4)      # подошва
         p.setPen(Qt.NoPen)
@@ -880,7 +1051,7 @@ def draw_foot(p, ankle, sx, q, view="front", hs=1.0):
         p.drawArc(QRectF(-0.4 * sx - 4, -2.4, 8, 5), 20 * 16, 140 * 16)
         p.drawLine(QPointF(-0.4 * sx, -2.8), QPointF(-0.4 * sx, 3.2))
     else:
-        p.setPen(_pen(q["rim"], 1.6))
+        p.setPen(rp)
         p.setBrush(g)
         p.drawRoundedRect(QRectF(-4.3, -3.6, 8.6, 7.2), 3.6, 3.4)   # пятка
         p.setPen(Qt.NoPen)
@@ -1474,7 +1645,19 @@ def draw_torso(p, q, view):
 
 
 # ----------------------------------------------------------------------------- кэш картинок
-_CACHE = {}
+_CACHE = OrderedDict()                 # LRU по байтам: ключ -> QPixmap
+_CACHE_LIMIT = 12 * 2 ** 20
+_cache_bytes = [0]
+
+
+def cache_stats():
+    """(число картинок, байт) — для отладки и бенчмарка."""
+    return len(_CACHE), _cache_bytes[0]
+
+
+def cache_clear():
+    _CACHE.clear()
+    _cache_bytes[0] = 0
 
 
 def _cached(p, key, box, fn, oversample=2.0):
@@ -1486,8 +1669,6 @@ def _cached(p, key, box, fn, oversample=2.0):
     k = key + (s,)
     pm = _CACHE.get(k)
     if pm is None:
-        if len(_CACHE) > 160:
-            _CACHE.clear()
         pm = QPixmap(int(box.width() * s) + 2, int(box.height() * s) + 2)
         pm.fill(Qt.transparent)
         qp = QPainter(pm)
@@ -1497,6 +1678,12 @@ def _cached(p, key, box, fn, oversample=2.0):
         fn(qp)
         qp.end()
         _CACHE[k] = pm
+        _cache_bytes[0] += pm.width() * pm.height() * 4
+        while _cache_bytes[0] > _CACHE_LIMIT and len(_CACHE) > 1:     # вытеснить самые старые
+            _, old = _CACHE.popitem(last=False)
+            _cache_bytes[0] -= old.width() * old.height() * 4
+    else:
+        _CACHE.move_to_end(k)
     p.save()
     p.setRenderHint(QPainter.SmoothPixmapTransform)
     p.drawPixmap(QRectF(box.x(), box.y(), pm.width() / s, pm.height() / s), pm, QRectF(pm.rect()))
@@ -1524,22 +1711,20 @@ ARM_WEBS = ((0, 0.15, 1), (1, 0, 1))
 
 def draw_spider(p, c, pose, eyes="open", view="front", part="all", style="chibi", hat=None, t=0.0, J=None):
     """Рисует персонажа в координатах модели (painter уже преобразован).
-    part: all — целиком; base — без рук из pose[front]; arms — только эти руки (для кэша мема)."""
+    part: all — целиком; base — без рук из pose[front]; arms — только эти руки (для кэша мема).
+    view: front / back / top / side (боком, лицом вправо: левые рука и нога — дальние, за торсом, темнее;
+    плечи и бёдра сведены к оси — side_joints; длины конечностей в плоскости картинки полные).
+    Укорочение *afs (рука к зрителю / от зрителя) меняет размер кисти: спереди крупнее, со спины мельче."""
     q = c["q"]
     st = STYLES[style]
     J = J or fk(style, pose)
     ow = 2.6
     back = view in ("back", "top")
     side = view == "side"
-    if side:      # боком: таз и ноги ближе к оси, плечи тоже; руки — полной длины (тянутся в плоскости картинки)
-        J = dict(J)
-        for key in ("rp", "rk", "rn", "lp", "lk", "ln"):
-            J[key] = (J[key][0] * SIDE_X, J[key][1])
-        for sd in "rl":
-            dx = J[sd + "s"][0] * (SIDE_X - 1)
-            for n in "sewh":
-                J[sd + n] = (J[sd + n][0] + dx, J[sd + n][1])
-        J["feet"] = ((J["rn"][0] + J["ln"][0]) / 2, J["feet"][1])
+    if side:
+        J = side_joints(J, style)
+    far = "l" if side else ""
+    lsx = pose.get("lsx", -1)
 
     def torso():
         if side:
@@ -1550,40 +1735,33 @@ def draw_spider(p, c, pose, eyes="open", view="front", part="all", style="chibi"
         else:
             draw_torso_cached(p, c, view, style)
 
-    def leg(s, phase):
-        sx = 1 if s == "r" else -1
-        hp, kn, an = J[s + "p"], J[s + "k"], J[s + "n"]
-        draw_limb(p, [hp, kn, an], PROFILES[style]["leg"], LEG_FILLS, LEG_WEBS, q, sx, ow=ow)
-        bx, by = _pt(kn, an, 0.32)                     # кромка сапога уголком
-        r = PROFILES[style]["leg"][1][0][1]
-        p.setPen(_pen(q["rimA"], 0.8 * r / 4.6))
-        p.drawLine(QPointF(bx - r * 0.9, by), QPointF(bx, by + r * (0.35 if back else -0.35)))
-        p.drawLine(QPointF(bx, by + r * (0.35 if back else -0.35)), QPointF(bx + r * 0.9, by))
-        p.setPen(Qt.NoPen)
-        if back:                                       # подколенная складка и икра
-            p.setPen(_pen(q["fold2"], 0.8 * r / 4.6))
-            p.drawLine(QPointF(kn[0] - r * 0.6, kn[1] + 0.3), QPointF(kn[0] + r * 0.6, kn[1] + 0.3))
-        else:                                          # блик на колене
-            p.setBrush(QColor(255, 255, 255, 55))
-            p.drawEllipse(QPointF(kn[0] - r * 0.15, kn[1] - r * 0.1), r * 0.55, r * 0.45)
-        draw_foot(p, an, sx, q, "back" if back else "front", st["hs"])
+    def leg(s):
+        sx = 1 if s == "r" else lsx
+        draw_limb(p, [J[s + "p"], J[s + "k"], J[s + "n"]], PROFILES[style]["leg"], LEG_FILLS, LEG_WEBS, q, sx,
+                  ow=ow, end=("foot", "back" if back else "front", st["hs"]),
+                  shade=FAR_SHADE if s in far else 0.0, tag="leg" + view)
 
     def legs():
         # ноги растут из-под таза: сначала ноги, потом торс поверх (паховая линия — край таза)
         if pose["legsfront"]:                          # колени к груди — ноги поверх торса
             torso()
             for s in "rl":
-                leg(s, "all")
+                leg(s)
             return
         for s in ("lr" if side else "rl"):             # боком: дальняя (левая) нога первой
-            leg(s, "all")
+            leg(s)
         torso()
 
     def arm(s):
+        sx = 1 if s == "r" else lsx
         el, wr = J[s + "e"], J[s + "w"]
-        draw_limb(p, [J[s + "s"], el, wr], PROFILES[style]["arm"], ARM_FILLS, ARM_WEBS, q,
-                  1 if s == "r" else -1, stripe=(0, 0.08, 0.95, "second", 1 if back else -1), ow=ow)
-        draw_hand(p, wr, el, pose["h" + s], q, st["hs"], t)
+        kind = pose["h" + s]
+        afs = pose.get(s + "afs", 1.0)
+        hs = st["hs"] * ((1 - 0.3 * (1 - afs)) if back else (1 + 0.35 * (1 - afs)))
+        draw_limb(p, [J[s + "s"], el, wr], PROFILES[style]["arm"], ARM_FILLS, ARM_WEBS, q, sx,
+                  stripe=(0, 0.08, 0.95, "second", 1 if back else -1), ow=ow,
+                  end=("hand", kind, round(hs, 3), _hand_flip(wr, el, kind)),
+                  shade=FAR_SHADE if s in far else 0.0, t=t, tag="arm" + view)
 
     def cover(s, head):
         # корень руки прячем под торс (и голову): рука растёт из тела, а не наклеена поверх контура
@@ -1596,22 +1774,120 @@ def draw_spider(p, c, pose, eyes="open", view="front", part="all", style="chibi"
             draw_head_cached(p, c, eyes, view, hat, style)
         p.restore()
 
+    under = pose.get("under", "") + far
+    front = pose["front"]
     if part != "arms":
-        for s in pose.get("under", ""):      # рука за телом (вид со спины) — почти не видна
-            arm(s)
+        for s in "rl":
+            if s in under and s not in front:        # рука за телом (вид со спины / дальняя боком)
+                arm(s)
         legs()
         if pose.get("item") == "guitar":
             draw_guitar(p, t)
         for s in "rl":
-            if s not in pose["front"] and s not in pose.get("under", ""):
+            if s not in front and s not in under:
                 arm(s)
                 cover(s, False)
         draw_head_cached(p, c, eyes, view, hat, style)
     if part != "base":
         for s in "rl":
-            if s in pose["front"]:
+            if s in front:
                 arm(s)
                 cover(s, True)
+
+
+# ----------------------------------------------------------------------------- мелочи для сценок
+def draw_fly(p, t, sx=1.0):
+    """Муха в начале координат (~6 единиц): тельце, голова, лапки, два крыла машут по t."""
+    p.save()
+    p.scale(sx, sx)
+    p.setPen(Qt.NoPen)
+    flap = math.sin(t * 70)
+    p.setBrush(QColor(215, 225, 240, 80))
+    for sy in (-1, 1):                                    # крылья — полупрозрачные лепестки над спинкой
+        p.save()
+        p.translate(-0.4, -0.7)
+        p.rotate(sy * (-30 + 28 * flap))
+        p.drawEllipse(QPointF(0, -1.7 * sy), 0.8, 1.9)
+        p.restore()
+    p.setPen(_pen(QColor("#1b1b1b"), 0.35))
+    for x, ang in ((-1.2, 215), (0.0, 250), (1.2, 290)):  # лапки
+        a = math.radians(ang)
+        p.drawLine(QPointF(x, 0.6), QPointF(x + 1.8 * math.cos(a), 0.6 - 1.8 * math.sin(a)))
+    p.setPen(_pen(QColor("#101010"), 0.3))
+    p.setBrush(QColor("#2e2e36"))
+    p.drawEllipse(QPointF(-0.6, 0), 2.2, 1.35)              # тельце
+    p.setBrush(QColor("#1d1d22"))
+    p.drawEllipse(QPointF(1.9, -0.1), 1.1, 1.0)             # голова
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#b4302e"))
+    p.drawEllipse(QPointF(2.4, -0.5), 0.45, 0.45)           # глаз
+    p.setBrush(QColor(255, 255, 255, 90))
+    p.drawEllipse(QPointF(-1.0, -0.5), 0.9, 0.4)            # блик
+    p.restore()
+
+
+def draw_rain(p, rect, t, density=0.6):
+    """Косой дождь в прямоугольнике rect (экранные координаты): не больше 120 штрихов, падают по t."""
+    n = max(1, min(120, int(density * rect.width() * rect.height() / 700)))
+    p.save()
+    p.setClipRect(rect)
+    p.setPen(_pen(QColor(205, 220, 240, 120), 1.0))
+    w, h = rect.width(), rect.height() + 40
+    seed = 12345
+    for i in range(n):
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        x0 = (seed % 10000) / 10000.0 * (w + 60) - 30
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        y0 = (seed % 10000) / 10000.0 * h
+        ln = 9 + (seed % 7)
+        sp = 420 + (seed % 160)
+        y = (y0 + t * sp) % h - 30
+        x = rect.x() + x0 - (y - y0) * 0.22
+        p.drawLine(QPointF(x, rect.y() + y), QPointF(x - ln * 0.22, rect.y() + y + ln))
+    p.restore()
+
+
+def draw_lamp(p, x, y_ground, h, t):
+    """Уличный фонарь (экранные координаты): столб на земле в (x, y_ground) высотой h, кронштейн, плафон,
+    мягкий тёплый конус света; лёгкое мерцание по t."""
+    p.save()
+    fl = 0.9 + 0.07 * math.sin(t * 7.3) + 0.03 * math.sin(t * 23.1)
+    top = y_ground - h
+    hx = x + h * 0.16                                     # плафон вынесен вперёд на кронштейне
+    hy = top + h * 0.07
+    cone = QPainterPath(QPointF(hx - h * 0.05, hy + h * 0.02))
+    cone.lineTo(QPointF(hx + h * 0.05, hy + h * 0.02))
+    cone.lineTo(QPointF(hx + h * 0.42, y_ground + h * 0.02))
+    cone.lineTo(QPointF(hx - h * 0.32, y_ground + h * 0.02))
+    cone.closeSubpath()
+    g = QLinearGradient(hx, hy, hx, y_ground)
+    g.setColorAt(0, QColor(255, 214, 120, int(150 * fl)))
+    g.setColorAt(1, QColor(255, 200, 90, 0))
+    p.setPen(Qt.NoPen)
+    p.setBrush(g)
+    p.drawPath(cone)
+    p.setPen(_pen(QColor("#2b2f36"), max(1.5, h * 0.03)))      # столб и кронштейн
+    p.drawLine(QPointF(x, y_ground), QPointF(x, top))
+    arm = QPainterPath(QPointF(x, top))
+    arm.quadTo(QPointF(x, top - h * 0.02), QPointF(hx, hy - h * 0.025))
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(arm)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#2b2f36"))
+    p.drawEllipse(QPointF(x, y_ground), h * 0.05, h * 0.012)   # основание
+    glow = QRadialGradient(QPointF(hx, hy + h * 0.01), h * 0.16)
+    glow.setColorAt(0, QColor(255, 230, 160, int(160 * fl)))
+    glow.setColorAt(1, QColor(255, 220, 140, 0))
+    p.setBrush(glow)
+    p.drawEllipse(QPointF(hx, hy + h * 0.01), h * 0.16, h * 0.16)
+    p.setPen(_pen(QColor("#2b2f36"), max(1.0, h * 0.015)))
+    p.setBrush(QColor("#3a3f47"))
+    p.drawPolygon(_poly((hx - h * 0.07, hy - h * 0.02), (hx + h * 0.07, hy - h * 0.02),
+                        (hx + h * 0.045, hy + h * 0.025), (hx - h * 0.045, hy + h * 0.025)))   # колпак
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(255, 236, 170, int(230 * fl)))
+    p.drawEllipse(QPointF(hx, hy + h * 0.025), h * 0.04, h * 0.018)   # лампа
+    p.restore()
 
 
 def _arc_point(pts, dist):
