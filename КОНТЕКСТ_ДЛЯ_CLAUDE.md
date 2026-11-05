@@ -43,6 +43,10 @@ pyinstaller), `скриншоты\` (самотесты, галереи), `READM
   подтягивается (Buddy.zip_to, тест --zip). Паутина — физическая нить spider.Rope (Верле, 14 звеньев) + art.draw_web_rope.
   Текст песни пользователь прислал в чат — в файл НЕ вписывали (авторское право), он вставляет сам.
 
+- Репозиторий (05.11): https://github.com/semyyon/SpiderPal — закрытый, ветка main, exe в Releases (v1.0).
+  .venv/build/dist/exe и noir_lyrics_ru.txt в репозиторий не попадают (.gitignore). Коммитить: `git add -A && git commit`,
+  новая сборка — `gh release create vX.Y SpiderPal.exe`. Аудит 05.11 — список исправленного и идей в README.
+
 ## Устройство
 - Оверлей: по окну на каждый экран, WA_TranslucentBackground + WindowTransparentForInput + Tool + TopMost, высота −1 px.
 - Перерисовка только грязных прямоугольников; голова и торс кэшируются в QPixmap (art._cached), мем — кэш неподвижной части.
