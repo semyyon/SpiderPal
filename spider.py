@@ -1570,7 +1570,7 @@ class Buddy:
             if not pr["zip"] and self.s["clickweb"] and now - pr["t"] < LONG_PRESS:
                 hw = self.world(self.J["lh"])    # короткий клик — выстрел паутиной из свободной (левой) руки
                 self.splats.append([pr["pos"][0], pr["pos"][1], now, hw[0], hw[1]])
-                if self.mode in ("hang", "sit") and self.sleep_f == 0 and not self.dozing and not self.meme:
+                if self.mode in ("hang", "sit", "crawl") and self.sleep_f == 0 and not self.dozing and not self.meme:
                     self.aim = dict(pt=(pr["pos"][0], pr["pos"][1]), until=now + AIM_TIME)
             self.press = None
         self.mouse_down = down
@@ -2130,7 +2130,7 @@ class Buddy:
             self.rot += wrap180(rot_t - self.rot) * min(1.0, dt * rate)
         self.flip += max(-dt * 9, min(dt * 9, self.flip_target - self.flip))
         self.pose = lerp_pose(self.pose, target_pose, min(1.0, dt * 14))
-        if self.aim and (now >= self.aim["until"] or mode not in ("hang", "sit") or self.sleep_f > 0):
+        if self.aim and (now >= self.aim["until"] or mode not in ("hang", "sit", "crawl") or self.sleep_f > 0):
             self.aim = None
         if self.aim:                     # рука на цель сразу (без сглаживания): нить выходит из ладони
             self.aim_arm(now)
@@ -2152,6 +2152,11 @@ class Buddy:
                   .translate(-self.att[0], -self.att[1]))
         if mode == "crawl":
             self.crawl_ik()
+            if self.aim:                 # после IK шага левая рука — на цель (T уже известна)
+                self.aim_arm(now)
+                Ja = fk(style, self.pose)
+                for key in ("ls", "le", "lw", "lh"):
+                    self.J[key] = Ja[key]
         dozing = mode == "sit" and self.s["sleep"] and not self.noir and now - self.last_move > (
             IDLE_SLEEP_NIGHT if self.period == "night" else IDLE_SLEEP)
         if now < self.dizzy_until:
@@ -2213,7 +2218,7 @@ class Buddy:
             Rb = 150 * self.scale + 16
             rects.append(QRectF(b["x"] - Rb, b["top"] - 10, 2 * Rb, max(b["y"] - b["top"] + Rb + 20, 30 * k)))
             if "wx" in b:                                                        # конус крепления
-                rects.append(QRectF(b["wx"] - 14 * k, b["top"] - 6, 28 * k, 26 * k))
+                rects.append(QRectF(b["wx"] - 16 * k, b["top"] - 6, 32 * k, 40 * k))
         for f in self.parts:
             rects.append(QRectF(f["x"] - 40, f["y"] - 40, 80, 80))
         if self.bubble:
@@ -2351,16 +2356,13 @@ class Buddy:
         for sp in self.splats:
             sx, sy, t0, px, py = sp
             age = now - t0
-            if self.aim and self.aim["pt"] == (sx, sy):      # рука ещё указывает — нить из её ладони
+            if age < 0.08 and self.aim and self.aim["pt"] == (sx, sy):   # нить летит из указывающей ладони
                 px, py = self.world(self.J["lh"])
                 sp[3], sp[4] = px, py
             if age < 0.08:
                 tip = QPointF(lerp(px, sx, age / 0.08), lerp(py, sy, age / 0.08))
                 draw_web_line(p, QPointF(px, py), tip, 0.9)
             else:
-                if age < AIM_TIME:
-                    draw_web_line(p, QPointF(px, py), QPointF(sx, sy), 0.9,
-                                  alpha=int(255 * min(1.0, (AIM_TIME - age) / 0.25)), cone=8 * k)
                 r = 16 * k * min(1.0, (age - 0.08) / 0.12)
                 alpha = 1.0 - max(0.0, (age - 0.7) / 0.9)
                 draw_splat(p, sx, sy, r, alpha)

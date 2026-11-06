@@ -1914,7 +1914,7 @@ def draw_web_rope(p, pts, w=1.0, alpha=255, cone=0.0, phase=0.0):
     if len(pts) < 2:
         return
     total = sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) for i in range(len(pts) - 1))
-    cone = min(cone, total * 0.4)
+    cone = min(cone * CONE_LEN, total * 0.4)
     a0 = pts[0]
     if cone > 2:
         j, (ux, uy) = _arc_point(pts, cone)
@@ -1931,7 +1931,8 @@ def draw_web_rope(p, pts, w=1.0, alpha=255, cone=0.0, phase=0.0):
     fan = QPainterPath()
     if cone > 2:
         nx, ny = -uy, ux
-        ends = [(a0[0] + nx * cone * 0.85 * k_, a0[1] + ny * cone * 0.85 * k_) for k_ in (-1, -0.5, 0, 0.5, 1)]
+        ends = [(a0[0] + nx * cone * CONE_SPREAD * k_, a0[1] + ny * cone * CONE_SPREAD * k_)
+                for k_ in (-1, -0.5, 0, 0.5, 1)]
         for e in ends:
             fan.moveTo(QPointF(*j))
             fan.quadTo(QPointF(lerp(j[0], e[0], 0.5) + ux * cone * 0.06, lerp(j[1], e[1], 0.5) + uy * cone * 0.06),
@@ -1977,19 +1978,24 @@ def draw_web_rope(p, pts, w=1.0, alpha=255, cone=0.0, phase=0.0):
     p.drawPath(twist)
 
 
+CONE_LEN = 1.8        # множитель длины конуса у крепления (06.11: «начинаться заранее»)
+CONE_SPREAD = 0.36    # полуширина веера в долях длины: tg 20° — острый конус (было 0,8 ≈ 39°)
+
+
 def draw_web_line(p, a, b, w=1.0, slack=0.0, alpha=255, cone=0.0):
     """Нить паутины от точки крепления a к b. cone > 0 — длина «конуса» у точки крепления: нить там
     расходится веером из пяти нитей, прилепленных к поверхности, с поперечной перемычкой (как настоящая паутина)."""
     dx, dy = b.x() - a.x(), b.y() - a.y()
     ln = math.hypot(dx, dy)
-    cone = min(cone, ln * 0.45)
+    cone = min(cone * CONE_LEN, ln * 0.45)
     start = a
     fan = QPainterPath()
     if cone > 2:
         ux, uy = dx / ln, dy / ln
         nx, ny = -uy, ux
         start = QPointF(a.x() + ux * cone, a.y() + uy * cone)       # где нить расходится
-        ends = [QPointF(a.x() + nx * cone * 0.8 * s, a.y() + ny * cone * 0.8 * s) for s in (-1, -0.5, 0, 0.5, 1)]
+        ends = [QPointF(a.x() + nx * cone * CONE_SPREAD * s, a.y() + ny * cone * CONE_SPREAD * s)
+                for s in (-1, -0.5, 0, 0.5, 1)]
         for e in ends:
             fan.moveTo(start)
             fan.lineTo(e)
