@@ -6,9 +6,10 @@ __pycache__/
 *.exe
 *.spec.bak
 скриншоты/*_selftest.json
-скриншоты/crawl_*
-скриншоты/zip_*
 скриншоты/крупно_*
 скриншоты/noir_lyrics_test.txt
 # текст песни пользователь хранит у себя — в репозиторий не попадает
 noir_lyrics_ru.txt
+скриншоты/noirzip_*
+скриншоты/night_noir_*
+*.gif

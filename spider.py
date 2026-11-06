@@ -25,7 +25,7 @@ from ctypes import wintypes
 
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QRect, QPoint, QAbstractNativeEventFilter
 from PySide6.QtGui import (QPainter, QColor, QPen, QIcon, QPixmap, QCursor, QFont, QFontMetrics, QAction,
-                           QActionGroup, QTransform, QGuiApplication, QPolygonF, QPainterPath)
+                           QActionGroup, QTransform, QGuiApplication, QPolygonF, QPainterPath, QLinearGradient, QImage)
 from PySide6.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu
 
 import art
@@ -83,6 +83,7 @@ DESCENT = 2.4             # с: гости (мем, гитарист) медле
 NOIR_BAND_AFTER = 1.0     # режим Noir: через сколько секунд сидения прилетает гитарист; номер идёт, пока не прервут
 SONG_LINE_EVERY = 6.5     # с: смена фразы песни в облачке
 AIM_TIME = 0.8            # с: после клика-выстрела левая рука указывает на точку, нить тянется из ладони
+ZIP_SLEEP = 30.0          # с: после долгого нажатия паук висит в точке, не ходит за курсором, потом засыпает
 LONG_PRESS = 0.6          # с: долгое нажатие — паутина цепляется за точку нажатия, паук летит к ней
 FLY_EVERY = (120, 240)    # с: муха у курсора — не чаще раза в 2–4 минуты
 FLY_IDLE = (2.0, 3.0)     # с покоя у курсора, после которых прилетает муха
@@ -449,6 +450,7 @@ class Buddy:
         self.next_quip = self.t_start + random.uniform(180, 300)
         self.rope = None                 # физическая нить, на которой висит/качается герой
         self.zip = False                 # долгое нажатие: подтягивается к точке крепления
+        self.zip_sleep = ZIP_SLEEP       # самотест укорачивает
         self.press = None                # текущее нажатие левой кнопки
         self.song = self.load_lyrics()
         self.roost = None                # место сна: dict(A, goal, arrived) — вис на кромке окна
@@ -1376,6 +1378,11 @@ class Buddy:
             self.L = max(55 * k, self.L - 650 * k * h)
             if self.L <= 55 * k + 0.5:
                 self.zip = False
+                # закрепился: висит здесь, курсор ему безразличен (как на месте сна), через zip_sleep засыпает;
+                # будит только клик по нему или новое долгое нажатие. Работает и у Нуара.
+                self.roost = dict(A=list(self.A), goal=[self.A[0], self.A[1] + 100 * k], arrived=True, hwnd=None,
+                                  chk=0.0, sleep_at=time.perf_counter() + self.zip_sleep, fixed=True)
+                self.log("zip: fixed")
         elif mode == "hang":
             tgt = max(30 * k, min(math.hypot(G[0] - self.A[0], G[1] - self.A[1]), 430 * k))
             rate = 380 * k * h
@@ -1517,7 +1524,7 @@ class Buddy:
         if self.roost:
             G = list(self.roost["goal"])
         want_sleep = (self.roost is not None and self.roost["arrived"] and self.mode == "hang"
-                      and not self.double)
+                      and not self.double and now >= self.roost.get("sleep_at", 0.0))
         self.sleep_f = max(0.0, min(1.0, self.sleep_f + (dt / 0.6 if want_sleep else -dt / 0.35)))
         if MEME_ENABLED and self.s["meme"] and idle > IDLE_MEME and not self.meme and not self.meme_shown:
             self.start_meme(now)
@@ -1600,7 +1607,7 @@ class Buddy:
         elif self.mode == "hang" and not self.shooting and self.sleep_f < 0.3:
             if far and not self.roost:
                 self.start_travel(now, G)
-            elif idle < 0.3 and dG > 55 * k:
+            elif idle < 0.3 and dG > 55 * k and not self.roost:     # закреплён — за курсором не ходит
                 self.start_crawl(now)
         elif self.mode == "sit":
             self.watch_window(now, G)       # слезает только по клику на него или если окно закрыли/свернули
@@ -1966,7 +1973,7 @@ class Buddy:
         if (self.mode == "sit" and self.sit and not self.band and not self.double and not self.meme
                 and now - self.sit["t0"] > NOIR_BAND_AFTER and now >= self.next_band):
             self.start_band(now)
-        quiet = self.mode in ("sit", "hang") and not self.bubble and not self.band
+        quiet = self.mode in ("sit", "hang") and not self.bubble and not self.band and self.sleep_f == 0
         if quiet and now >= self.next_cough:
             self.cough_until = now + 0.9
             self.say(random.choice(NOIR_COUGH), now)
@@ -2562,8 +2569,36 @@ def memory_mb():
     return pmc.WorkingSetSize / 2 ** 20, pmc.PeakWorkingSetSize / 2 ** 20, pmc.PagefileUsage / 2 ** 20
 
 
+class Backdrop(QWidget):
+    """Подложка на весь основной монитор для самотеста: снимки и GIF без рабочего стола пользователя."""
+    def __init__(self, screen):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)   # поверх окон пользователя
+        self.setGeometry(screen.geometry())
+        self.show()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        g = QLinearGradient(0, 0, 0, self.height())
+        g.setColorAt(0, QColor(222, 228, 240))
+        g.setColorAt(1, QColor(196, 206, 226))
+        p.fillRect(self.rect(), g)
+        p.setPen(QColor(255, 255, 255, 90))
+        step = 48
+        for x in range(0, self.width(), step):
+            p.drawLine(x, 0, x, self.height())
+        for y in range(0, self.height(), step):
+            p.drawLine(0, y, self.width(), y)
+        f = QFont("Segoe UI")
+        f.setPixelSize(28)
+        p.setFont(f)
+        p.setPen(QColor(90, 100, 125))
+        p.drawText(QRectF(0, 24, self.width(), 40), Qt.AlignHCenter, APP_NAME + " — demo")
+        p.end()
+
+
 def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, crawl_demo=False, zip_demo=False,
-                 features_demo=False):
+                 features_demo=False, backdrop=False, record=None):
     """Курсор подменяется виртуальным (реальную мышь пользователя не трогаем):
     0–1 с покой; 1–4 с круг (ползёт); 4.0–5.0 с тряска (головокружение); с 5.0 с покой:
     двойник (вызов на 6 с), сидит на окне, сон, кокон в 24.6 с, мем в 34.6 с; с 38 с движение."""
@@ -2572,6 +2607,38 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
     c = scr.availableGeometry().center()
     t0 = b.t_start
     x0, y0 = c.x() - 350, c.y() + 120
+    if backdrop:
+        run_selftest.backdrop = Backdrop(scr)       # ссылка живёт, пока идёт тест
+        for _ in range(5):                          # подложка должна прорисоваться до первого кадра/снимка
+            app.processEvents()
+            time.sleep(0.05)
+        for o in b.overlays:                        # пауки — над подложкой (оба окна «поверх всех»)
+            o.raise_()
+        app.processEvents()
+    frames = []                                     # запись GIF: кадры 10 к/с, область вокруг сцены
+    rec_rect = None
+    if record:
+        g_ = scr.geometry()
+        rec_rect = QRect(max(g_.x(), x0 - 330), max(g_.y(), y0 - 520), 1000, 700).intersected(g_)
+        rec = {"next": t0 + 0.4}                    # первые кадры — после прорисовки подложки
+
+        def grab_frame():
+            now_ = time.perf_counter()
+            if now_ < rec["next"]:
+                return
+            rec["next"] = now_ + 0.1
+            pm = scr.grabWindow(0, rec_rect.x() - g_.x(), rec_rect.y() - g_.y(), rec_rect.width(), rec_rect.height())
+            cx, cy = b.cursor_fn()
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.translate(cx - rec_rect.x(), cy - rec_rect.y())
+            arrow = QPolygonF([QPointF(*q) for q in ((0, 0), (0, 17), (4, 13), (7, 20), (9.5, 19), (6.5, 12), (12, 12))])
+            p.setPen(QPen(QColor(0, 0, 0), 1.2))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawPolygon(arrow)
+            p.end()
+            frames.append(pm.toImage().scaled(rec_rect.width() * 4 // 5, rec_rect.height() * 4 // 5,
+                                              Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
 
     def fake():
         t = time.perf_counter() - t0
@@ -2673,6 +2740,9 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
             return
         finished.append(1)
         mark("end")
+        if record and frames:
+            save_gif(os.path.join(outdir, record), frames, 100)
+            log["gif"] = dict(file=record, frames=len(frames), rect=[rec_rect.x(), rec_rect.y(), rec_rect.width(), rec_rect.height()])
 
         def seg(a, z):
             (w0, c0, f0, p0), (w1, c1, f1, p1) = marks[a], marks[z]
@@ -2710,7 +2780,7 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
                  (6.5, lambda: shot("s3_летит.png")), (7.5, lambda: shot("s4_летит.png")),
                  (11.0, lambda: shot("s5_спит.png")), (11.5, lambda: check("sleep")), (11.7, finish)]
     watch = []          # (имя, условие, действие) — снимки по событиям, а не по часам
-    if noir_demo:       # режим Noir: садится, через NOIR_BAND_AFTER прилетает гитарист; потом клик по пауку
+    if noir_demo and not zip_demo:   # режим Noir: садится, через NOIR_BAND_AFTER прилетает гитарист; потом клик
         # тестовый файл со служебными строками (не текст песни): проверка, что строки идут по очереди
         test_lyrics = os.path.join(outdir, "noir_lyrics_test.txt")
         with open(test_lyrics, "w", encoding="utf-8") as fh:
@@ -2804,11 +2874,23 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
                                 flip_min=round(min(f["flip"] for f in frames), 2) if n else None, shots=shots)
             finish()
         sched = [(1.0, lambda: mark("a")), (9.0, crawl_finish)]
-    if zip_demo:        # долгое нажатие: курсор в точку, кнопка зажата 0,7 с -> паутина цепляется, паук летит к ней
+    if zip_demo:        # долгое нажатие: курсор в точку, кнопка зажата 0,7 с -> паутина цепляется, паук летит к ней,
+        # закрепляется там, курсор уходит — висит; через zip_sleep (в тесте 3 с) засыпает; клик по нему — встаёт
         tx, ty = x0 + 420, y0 - 380
         win["r"] = (-10000, -10000, -9000, -9000)
-        b.cursor_fn = lambda: (x0, y0) if time.perf_counter() - t0 < 1.5 else (tx, ty)
-        b.mouse_fn = lambda: 1.6 <= time.perf_counter() - t0 < 2.3
+        b.zip_sleep = 3.0
+        zst = {"away": None, "click": None}
+
+        def zip_cursor():
+            t = time.perf_counter() - t0
+            if zst["click"] is not None:
+                return zst["click"]
+            if zst["away"] is not None:
+                return zst["away"]
+            return (x0, y0) if t < 1.5 else (tx, ty)
+        b.cursor_fn = zip_cursor
+        b.mouse_fn = lambda: 1.6 <= time.perf_counter() - t0 < 2.3 or (zst["click"] is not None
+                                                                       and time.perf_counter() - zst["t_click"] < 0.12)
         track = []
         poll_extra.append(lambda: track.append((round(time.perf_counter() - t0, 2), b.mode, round(math.hypot(
             b.P[0] - tx, b.P[1] - ty)), b.rope is not None)))
@@ -2818,8 +2900,33 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
             hang = [tr for tr in track if tr[1] == "hang" and tr[0] > 2.0]
             log["zip"] = dict(zip_event=ev, first_hang_t=hang[0][0] if hang else None,
                               dist_to_point_end=track[-1][2], anchor=[round(v) for v in b.A], target=[tx, ty],
-                              mode_end=track[-1][1], rope_end=track[-1][3])
+                              mode_end=track[-1][1], rope_end=track[-1][3], fixed=zst.get("fixed"),
+                              stays_when_cursor_leaves=zst.get("stays"), sleep=zst.get("sleep"), wake=zst.get("wake"))
             finish()
+
+        def zip_away():            # закрепился: курсор уходит далеко, паук должен остаться
+            zst["away"] = (x0 - 300, y0 + 200)
+            zst["P0"] = list(b.P)
+            zst["fixed"] = dict(roost=b.roost is not None and b.roost.get("fixed") is True, mode=b.mode,
+                                anchor=[round(v) for v in b.A], t=round(time.perf_counter() - t0, 2))
+
+        def zip_stays():
+            zst["stays"] = dict(moved_px=round(math.hypot(b.P[0] - zst["P0"][0], b.P[1] - zst["P0"][1]), 1),
+                                mode=b.mode, sleep_f=round(b.sleep_f, 2))
+
+        def zip_sleep_check():
+            zst["sleep"] = dict(sleep_f=round(b.sleep_f, 2), mode=b.mode, rot=round(b.rot, 1), noir=b.noir,
+                                t=round(time.perf_counter() - t0, 2))
+            shot("zip_4_спит_в_точке.png", False)
+
+        def zip_click():           # клик по спящему — просыпается и идёт к курсору
+            w = b.world((0, 40))
+            zst["click"] = (w[0], w[1])
+            zst["t_click"] = time.perf_counter()
+
+        def zip_wake_check():
+            zst["wake"] = dict(roost=b.roost is not None, sleep_f=round(b.sleep_f, 2), mode=b.mode,
+                               event=bool([e for e in b.events if e[1] == "wake: click"]))
         zs = {}
 
         def zip_shots():
@@ -2831,7 +2938,9 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
                 shot("zip_2_подтягивается.png", True)
         poll_extra.append(zip_shots)
         sched = [(1.0, lambda: mark("a")), (3.6, lambda: shot("zip_3_висит_в_точке.png", True)),
-                 (3.7, lambda: mark("b")), (3.8, zip_finish)]
+                 (3.7, lambda: mark("b")), (4.0, zip_away), (5.5, zip_stays),
+                 (9.5, zip_sleep_check), (10.0, zip_click), (11.5, zip_wake_check),
+                 (11.8, lambda: shot("zip_5_проснулся.png", True)), (12.0, zip_finish)]
     if features_demo:   # муха, прогулка по кромкам, Ctrl+S/Z, булавка, полноэкранное окно, горячая клавиша,
         # обмен с напарником на другом мониторе, покой без перерисовок. Все «нажатия» — подменные функции.
         F = log["features"] = {}
@@ -3017,8 +3126,25 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
         for fn_ in poll_extra:
             fn_()
 
+    if record:
+        poll_extra.append(grab_frame)
     poll.timeout.connect(run_due)
     poll.start(10)
+
+
+def save_gif(path, frames, ms):
+    """QImage-кадры -> GIF через Pillow (только для демо; в exe не нужен)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    ims = []
+    for im in frames:
+        im = im.convertToFormat(QImage.Format_RGB888)
+        ptr = im.constBits()
+        pil = Image.frombytes("RGB", (im.width(), im.height()), bytes(ptr), "raw", "RGB", im.bytesPerLine())
+        ims.append(pil.quantize(colors=128, method=Image.Quantize.MEDIANCUT))
+    ims[0].save(path, save_all=True, append_images=ims[1:], duration=ms, loop=0, optimize=True)
 
 
 # ----------------------------------------------------------------------------- запуск
@@ -3050,7 +3176,8 @@ def main():
         out = argv[i + 1] if len(argv) > i + 1 else os.path.join(app_dir(), "скриншоты")
         prefix = argv[argv.index("--prefix") + 1] if "--prefix" in argv else ""
         run_selftest(app, b, out, prefix, "--sleep" in argv, "--noir" in argv, "--crawl" in argv, "--zip" in argv,
-                     "--features" in argv)
+                     "--features" in argv, backdrop="--backdrop" in argv,
+                     record=argv[argv.index("--record") + 1] if "--record" in argv else None)
     app.exec()
 
 
