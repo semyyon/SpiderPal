@@ -1,0 +1,196 @@
+{
+ "style": "chibi",
+ "time": "2026-11-06 12:31:13.485538",
+ "costume": "classic",
+ "hat": null,
+ "events": {
+  "1_ползёт.png": {
+   "t": 2.88,
+   "mode": "crawl",
+   "at": [
+    747,
+    539
+   ],
+   "cover": {
+    "ok": true,
+    "painted": [
+     725,
+     499,
+     54,
+     71
+    ],
+    "overflow": null
+   }
+  },
+  "2_голова_кругом.png": {
+   "t": 5.47,
+   "mode": "crawl",
+   "at": [
+    581,
+    456
+   ],
+   "cover": {
+    "ok": true,
+    "painted": [
+     468,
+     388,
+     187,
+     89
+    ],
+    "overflow": null
+   }
+  },
+  "4_сидит_на_окне.png": {
+   "t": 20.57,
+   "mode": "sit",
+   "at": [
+    556,
+    257
+   ],
+   "cover": {
+    "ok": true,
+    "painted": [
+     535,
+     204,
+     42,
+     67
+    ],
+    "overflow": null
+   }
+  },
+  "4б_окно_сдвинули.png": {
+   "t": 21.33,
+   "mode": "air",
+   "at": [
+    594,
+    217
+   ],
+   "cover": {
+    "ok": true,
+    "painted": [
+     541,
+     141,
+     93,
+     114
+    ],
+    "overflow": null
+   }
+  },
+  "at_32s": {
+   "t": 32.0,
+   "mode": "sit",
+   "meme": null,
+   "sleep_f": 0.0,
+   "band": null,
+   "exstyle": {
+    "TRANSPARENT": true,
+    "LAYERED": true,
+    "TOOLWINDOW": true,
+    "TOPMOST": true
+   }
+  },
+  "at_40s": {
+   "t": 40.0,
+   "mode": "sit",
+   "meme": null,
+   "sleep_f": 0.0,
+   "band": null,
+   "exstyle": {
+    "TRANSPARENT": true,
+    "LAYERED": true,
+    "TOOLWINDOW": true,
+    "TOPMOST": true
+   }
+  }
+ },
+ "crawl_1_4s": {
+  "fps": 116.3,
+  "paints": 349,
+  "cpu_total_pct": 1.26
+ },
+ "double_7_14s": {
+  "fps": 49.4,
+  "paints": 258,
+  "cpu_total_pct": 0.48
+ },
+ "calm_18_24s": {
+  "fps": 45.0,
+  "paints": 208,
+  "cpu_total_pct": 0.78
+ },
+ "meme_34_38s": {
+  "fps": 20.0,
+  "paints": 0,
+  "cpu_total_pct": 0.04
+ },
+ "whole": {
+  "fps": 45.0,
+  "paints": 1270,
+  "cpu_total_pct": 0.43
+ },
+ "memory_mb": {
+  "working_set": 143.3,
+  "peak": 164.2,
+  "private": 83.4
+ },
+ "modes": [
+  [
+   1.44,
+   "crawl"
+  ],
+  [
+   5.74,
+   "hang"
+  ],
+  [
+   8.03,
+   "crawl"
+  ],
+  [
+   9.16,
+   "sit"
+  ],
+  [
+   21.13,
+   "air:flip"
+  ],
+  [
+   21.55,
+   "hang"
+  ],
+  [
+   21.63,
+   "crawl"
+  ],
+  [
+   22.5,
+   "sit"
+  ]
+ ],
+ "log": [
+  [
+   4.76,
+   "say: Whoa... my head is spinning!"
+  ],
+  [
+   4.76,
+   "dizzy"
+  ],
+  [
+   9.16,
+   "sit"
+  ],
+  [
+   21.13,
+   "say: Hey, careful!"
+  ],
+  [
+   21.13,
+   "window moved: jump"
+  ],
+  [
+   22.5,
+   "sit"
+  ]
+ ]
+}
