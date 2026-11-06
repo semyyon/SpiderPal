@@ -174,6 +174,6 @@ Ctrl+Alt+S, новая расстановка мема, проверка пок�
 ## Пересборка exe
 
 ```
-.venv\Scripts\pyinstaller.exe --noconfirm --onefile --windowed --name SpiderPal --icon spider.ico --exclude-module tkinter spider.py
+.venv\Scripts\pyinstaller.exe --noconfirm --onefile --windowed --name SpiderPal --icon spider.ico --exclude-module tkinter --exclude-module PIL spider.py
 ```
 Результат — `dist\SpiderPal.exe`.
