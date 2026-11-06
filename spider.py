@@ -76,6 +76,7 @@ IDLE_SIT = 3.0            # с без движения мыши -> садитс�
 IDLE_SLEEP = 5.0          # -> засыпает (днём)
 IDLE_SLEEP_NIGHT = 3.0    # -> засыпает (ночью)
 IDLE_MEME = 600.0         # -> мем с тремя пауками (10 минут простоя)
+MEME_ENABLED = False      # мем убран (06.11, пользователь: «ты не можешь сделать его нормально»); код оставлен
 DOUBLE_EVERY = 300.0      # двойник прилетает раз в 5 минут
 DOUBLE_ENABLED = False    # двойник раз в 5 минут убран (05.11); с 06.11 он приходит по Ctrl+C (poll_keys)
 DESCENT = 2.4             # с: гости (мем, гитарист) медленно спускаются на паутине, держась за неё рукой
@@ -855,12 +856,15 @@ class Buddy:
                           ("Hide over fullscreen apps", "fs_hide")]
         if not DOUBLE_ENABLED:
             toggles = [t for t in toggles if t[1] != "double"]
+        if not MEME_ENABLED:
+            toggles = [t for t in toggles if t[1] != "meme"]
         for text, key in toggles:
             a = m.addAction(text)
             a.setCheckable(True)
             a.setChecked(bool(self.s[key]))
             a.toggled.connect(lambda v, key=key: self.set_opt(key, v))
-        m.addAction("Show the meme now").triggered.connect(lambda: self.start_meme(time.perf_counter()))
+        if MEME_ENABLED:
+            m.addAction("Show the meme now").triggered.connect(lambda: self.start_meme(time.perf_counter()))
         if DOUBLE_ENABLED:
             m.addAction("Call the double").triggered.connect(lambda: self.start_double(time.perf_counter(), True))
         m.addSeparator()
@@ -1515,7 +1519,7 @@ class Buddy:
         want_sleep = (self.roost is not None and self.roost["arrived"] and self.mode == "hang"
                       and not self.double)
         self.sleep_f = max(0.0, min(1.0, self.sleep_f + (dt / 0.6 if want_sleep else -dt / 0.35)))
-        if self.s["meme"] and idle > IDLE_MEME and not self.meme and not self.meme_shown:
+        if MEME_ENABLED and self.s["meme"] and idle > IDLE_MEME and not self.meme and not self.meme_shown:
             self.start_meme(now)
         self.update_meme(now)
 
@@ -2697,8 +2701,8 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
              (18.0, lambda: mark("e")), (20.5, lambda: shot("4_сидит_на_окне.png")), (21.0, move_window),
              (21.25, lambda: shot("4б_окно_сдвинули.png")), (24.0, lambda: mark("f")),
              (32.0, lambda: check("at_32s")),
-             (33.0, lambda: b.start_meme(time.perf_counter())),     # мем по таймеру — через 10 мин, в тесте вызов
-             (34.5, lambda: mark("g")), (37.5, lambda: shot("6_мем.png", True)),   # ≥4 с после старта: все стоят
+             (33.0, lambda: MEME_ENABLED and b.start_meme(time.perf_counter())),   # мем убран (MEME_ENABLED)
+             (34.5, lambda: mark("g")), (37.5, lambda: MEME_ENABLED and shot("6_мем.png", True)),
              (38.0, lambda: mark("h")),                                             # с 38 с курсор движется — уходят
              (40.0, lambda: check("at_40s")), (40.2, finish)]
     if sleep_demo:      # сон: 5 с покоя -> улетает к боковой кромке окна и висит вниз головой
