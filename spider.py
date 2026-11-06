@@ -77,7 +77,7 @@ IDLE_SLEEP = 5.0          # -> засыпает (днём)
 IDLE_SLEEP_NIGHT = 3.0    # -> засыпает (ночью)
 IDLE_MEME = 600.0         # -> мем с тремя пауками (10 минут простоя)
 DOUBLE_EVERY = 300.0      # двойник прилетает раз в 5 минут
-DOUBLE_ENABLED = False    # двойник пока убран по просьбе пользователя (05.11); True — вернуть меню и прилёты
+DOUBLE_ENABLED = False    # двойник раз в 5 минут убран (05.11); с 06.11 он приходит по Ctrl+C (poll_keys)
 DESCENT = 2.4             # с: гости (мем, гитарист) медленно спускаются на паутине, держась за неё рукой
 NOIR_BAND_AFTER = 1.0     # режим Noir: через сколько секунд сидения прилетает гитарист; номер идёт, пока не прервут
 SONG_LINE_EVERY = 6.5     # с: смена фразы песни в облачке
@@ -260,7 +260,7 @@ def settings_path():
 
 DEFAULTS = dict(costume="classic", size=1.0, hat="auto", clickweb=True, sleep=True, meme=True,
                 windows=True, seasonal=True, bubbles=True, double=True, hidden=False, noir_mode=False,
-                fs_hide=True, fly=True, stroll=True, rain=True, keys=True, buddy=True)
+                fs_hide=True, fly=True, stroll=True, rain=True, keys=True)
 
 
 def autostart_cmd():
@@ -500,7 +500,7 @@ class Buddy:
         self.keys_prev = {}
         self.fs_hidden = set()           # индексы оверлеев, спрятанных под полноэкранным окном
         self.last_fs_check = 0.0
-        self.side = None                 # напарник на другом мониторе (Sidekick)
+        self.side = None                 # напарника на втором мониторе больше нет (06.11); поле — для совместимости
         self.hk_filter = None
         self.dozing = False
         self.last_win_check = 0.0
@@ -538,7 +538,6 @@ class Buddy:
 
         self.build_tray()
         self.apply_hidden()
-        self.setup_side(self.t_start)
         if not selftest:                 # глобальная горячая клавиша Ctrl+Alt+S — спрятать/показать
             self.hk_filter = HotkeyFilter(self.toggle_hidden)
             app.installNativeEventFilter(self.hk_filter)
@@ -704,9 +703,6 @@ class Buddy:
         self.vrect = r
         self.fs_hidden = set()
         self.refresh_visibility()
-        if self.side is not None:        # мониторы поменялись — напарника заново на свободный экран
-            self.side = None
-            self.setup_side(time.perf_counter())
 
     def refresh_visibility(self):
         hidden = self.s.get("hidden")
@@ -832,11 +828,9 @@ class Buddy:
                           ("Holidays and time of day (pajamas, coffee)", "seasonal"),
                           ("Catch flies near the cursor", "fly"),
                           ("Walk along window edges", "stroll"),
-                          ("React to Ctrl+S / Ctrl+Z", "keys"),
+                          ("React to Ctrl+S / Ctrl+Z, double on Ctrl+C", "keys"),
                           ("Noir: rain and a street lamp at night", "rain"),
                           ("Hide over fullscreen apps", "fs_hide")]
-        if len(QGuiApplication.screens()) >= 2:
-            toggles.append(("Buddy on the other monitor", "buddy"))
         if not DOUBLE_ENABLED:
             toggles = [t for t in toggles if t[1] != "double"]
         for text, key in toggles:
@@ -882,13 +876,6 @@ class Buddy:
     def set_opt(self, key, val):
         self.s[key] = val
         self.save()
-        if key == "buddy":
-            if val:
-                self.setup_side(time.perf_counter())
-            else:
-                self.push_rects(self.prev_side_rects)   # стереть напарника
-                self.prev_side_rects = []
-                self.side = None
 
     def set_noir_mode(self, on):
         """Режим Noir: вид Spider-Noir и его поведение; гитарист прилетает, когда он сядет."""
@@ -1103,7 +1090,7 @@ class Buddy:
                            ty=self.P[1], y=float(g.top()) - 60, top=float(g.top()), T=QTransform(), J=None,
                            pose=get_pose("hang", self.style), last_cycle=-1)
         self.next_double = now + DOUBLE_EVERY
-        self.say("High five, double!" if act == "five" else "Pillow fight!", now)
+        self.say("Copied!" if act == "five" else "Pasted a pillow!", now)
         self.log("double: " + act)
         return True
 
@@ -1121,7 +1108,7 @@ class Buddy:
             return
         k = self.k
         if d["phase"] == "in":
-            u = min(1.0, (now - d["t0"]) / 0.8)
+            u = min(1.0, (now - d["t0"]) / DESCENT)        # медленный спуск, как у гостей мема и гитариста
             d["y"] = lerp(d["top"] - 60, d["ty"], 1 + 2.5 * (u - 1) ** 3 + 1.5 * (u - 1) ** 2)
             if u >= 1:
                 d["phase"], d["t_act"] = "act", now
@@ -1518,10 +1505,6 @@ class Buddy:
             else:
                 self.next_double = now + 20
 
-        # напарник на другом мониторе: курсор пришёл на его экран — меняемся местами (без перелёта)
-        if (self.side is not None and scr is not None and scr is self.side.screen and self.pin is None
-                and not self.meme and self.screen_at(*self.P) is not self.side.screen):
-            self.swap_with_side(now)
         # средняя кнопка по пауку — тащим; отпустили — приколот на паутине сверху, курсор ему безразличен
         mb = self.mbutton_fn()
         if (mb and not self.mb_down and self.pin is None and not self.meme and self.mode in ("hang", "sit", "crawl")
@@ -1839,16 +1822,23 @@ class Buddy:
         self.set_mode("pin")
         self.log("pin: drag")
 
-    # --- Ctrl+S / Ctrl+Z
+    # --- Ctrl+S / Ctrl+Z — жест; Ctrl+C — «копия»: двойник спускается на паутине рядом
     def poll_keys(self, now):
         if not self.s["keys"]:
             return
         ctrl = self.key_fn(0x11)
-        for vk, name in ((0x53, "S"), (0x5A, "Z")):
+        for vk, name in ((0x53, "S"), (0x5A, "Z"), (0x43, "C")):
             down = ctrl and self.key_fn(vk)
             was = self.keys_prev.get(vk, False)
             self.keys_prev[vk] = down
-            if (down and not was and now >= self.next_react and self.mode in ("hang", "sit") and not self.meme
+            if not (down and not was):
+                continue
+            if name == "C":
+                if (self.mode == "hang" and not self.meme and not self.double and not self.react
+                        and self.sleep_f == 0 and not self.dozing and self.start_double(now, True)):
+                    self.log("react: C")
+                continue
+            if (now >= self.next_react and self.mode in ("hang", "sit") and not self.meme
                     and not self.react and self.sleep_f == 0 and not self.dozing):
                 self.next_react = now + REACT_GAP
                 self.react = dict(pose="thumbs" if name == "S" else "guilty", until=now + 1.5)
@@ -1879,65 +1869,6 @@ class Buddy:
         left, top, right, _ = st["rect"]
         side = 1.0 if right - st["x"] >= st["x"] - left else -1.0
         return (st["x"] + side * 85 * k, top, 95 * k)
-
-    # --- напарник на другом мониторе
-    def setup_side(self, now):
-        """Напарник живёт на мониторе без курсора (только если мониторов ≥ 2 и включено в меню)."""
-        screens = QGuiApplication.screens()
-        if not self.s["buddy"] or len(screens) < 2 or self.side is not None:
-            return
-        cur = self.cursor_fn()
-        here = self.screen_at(*cur) or screens[0]
-        free = [s_ for s_ in screens if s_ is not here]
-        if not free:
-            return
-        key = random.choice([c["key"] for c in COSTUMES if c["key"] not in ("noir", self.s["costume"])])
-        self.side = Sidekick(self, free[0], key, None, now)
-
-    def swap_with_side(self, now):
-        """Курсор ушёл на монитор напарника: он становится героем на своём месте (костюм остаётся с телом),
-        а бывший герой — напарником там, где был. Никто никуда не летит."""
-        sd = self.side
-        old_p, old_key = list(self.P), self.s["costume"]
-        old_scr = self.screen_at(*old_p)
-        if old_scr is None or old_scr is sd.screen:      # герой уже на экране напарника (пин, мем) — напарнику
-            free = [s_ for s_ in QGuiApplication.screens() if s_ is not sd.screen]   # любой другой экран
-            old_scr = free[0] if free else None
-        self.end_band(now)
-        self.band = None
-        self.roost = None
-        self.sit = None
-        self.sit_target = None
-        self.stroll = None
-        self.fly = None
-        self.react = None
-        self.zip = False
-        self.shooting = False
-        self.retracts = []
-        self.sleep_f = 0.0
-        self.P, self.A = list(sd.P), list(sd.A)
-        self.L = max(20.0, math.hypot(self.P[0] - self.A[0], self.P[1] - self.A[1]))
-        self.V = [0.0, 0.0]
-        self.vs = [0.0, 0.0]
-        self.trail = 0.0
-        self.rope = Rope(self.A, self.P)
-        self.rope.p, self.rope.q = list(sd.rope.p), list(sd.rope.q)
-        self.rope_still = False
-        self.pose = dict(sd.pose)
-        self.J = fk(self.style, self.pose)
-        self.att = self.J["rh"]
-        self.rot = sd.rot if sd.sleep_f < 0.5 else -12 * sign(sd.flip)   # спящий (sleep_f→0) не вверх ногами
-        self.flip = self.flip_target = sd.flip
-        s = self.scale                   # преобразование — сразу, иначе set_pivot в этом же тике возьмёт старое
-        self.T = (QTransform().translate(self.P[0], self.P[1]).rotate(self.rot).scale(s * self.flip, s)
-                  .translate(-self.att[0], -self.att[1]))
-        self.set_mode("hang")
-        if not self.noir:
-            self.set_costume(sd.key)
-        self.side = Sidekick(self, old_scr, old_key, old_p if old_scr is self.screen_at(*old_p) else None,
-                             now) if old_scr is not None else None
-        self.swap_P = list(self.P)       # для самотеста: где герой оказался в момент обмена
-        self.log("swap")
 
     def plan_roost(self, cur):
         """Место сна: боковая кромка активного окна (верхний угол), а без окна — край экрана. Паук вешается
@@ -2413,7 +2344,7 @@ class Buddy:
         if d["J"] is None:
             return
         hand = d["T"].map(QPointF(*d["J"]["rh"]))
-        draw_web_line(p, QPointF(d["x"], d["top"]), hand, max(1.0, self.k * 0.85))
+        draw_web_line(p, QPointF(d["x"], d["top"]), hand, max(1.0, self.k * 0.85), cone=12 * self.k)
         p.save()
         p.setTransform(d["T"], True)
         draw_spider(p, COSTUME_BY_KEY[d["key"]], d["pose"], "open", "front", style=self.style, t=now, J=d["J"])
@@ -2565,136 +2496,6 @@ class Buddy:
 
 
 # ----------------------------------------------------------------------------- напарник на другом мониторе
-class Sidekick:
-    """Напарник в другом костюме на мониторе без курсора: висит спокойно, изредка спит или потягивается.
-    Лёгкий: не ползает и не летает, тело в покое — из кэша; когда курсор приходит на его экран, он и герой
-    меняются местами (Buddy.swap_with_side). Своё положение, поза, костюм, нить."""
-    BOX = QRectF(-62, -40, 124, 152)
-
-    def __init__(self, b, screen, key, P, now):
-        self.b = b
-        self.screen = screen
-        self.key = key
-        g = screen.geometry()
-        k = b.k
-        if P is None:
-            P = [g.center().x() + random.uniform(-0.2, 0.2) * g.width(), g.top() + 4 + 0.38 * g.height()]
-        self.P = [float(P[0]), float(P[1])]
-        self.A = [self.P[0], max(g.top() + 4.0, self.P[1] - 150 * k)]
-        self.rope = Rope(self.A, self.P)
-        self.rope_still = False
-        self.pose = pose_hang(b.style)
-        self.J = fk(b.style, self.pose)
-        self.state = "hang"
-        self.until = 0.0
-        self.next_act = now + random.uniform(30, 90)
-        self.sleep_f = 0.0
-        self.rot = 0.0
-        self.flip = random.choice((-1.0, 1.0))
-        self.T = QTransform()
-        self.animating = True
-        self.sig = None
-        self.prev_sig = None
-        self.cache = {}
-        self.update(now, 0.0)
-
-    def update(self, now, dt):
-        b = self.b
-        k = b.k
-        if self.state == "hang" and now >= self.next_act:
-            self.state = random.choice(("sleep", "stretch", "sleep"))
-            self.until = now + (random.uniform(12, 20) if self.state == "sleep" else 1.8)
-            b.log("side: " + self.state)
-        elif self.state != "hang" and now >= self.until:
-            self.state = "hang"
-            self.next_act = now + random.uniform(40, 120)
-        want = 1.0 if self.state == "sleep" else 0.0
-        self.sleep_f = max(0.0, min(1.0, self.sleep_f + (dt / 0.6 if want else -dt / 0.35)))
-        f = smooth(self.sleep_f)
-        if self.state == "stretch":
-            target = get_pose("stretch", b.style)
-        else:
-            target = lerp_pose(pose_hang(b.style), get_pose("sleep", b.style), f)
-        self.pose = lerp_pose(self.pose, target, min(1.0, dt * 14)) if dt > 0 else target
-        rot_t = -12 * sign(self.flip) * (1 - f) + 180 * f
-        self.rot += wrap180(rot_t - self.rot) * min(1.0, dt * 14)
-        self.J = fk(b.style, self.pose)
-        rh, lh = self.J["rh"], self.J["lh"]
-        att = (lerp(rh[0], (rh[0] + lh[0]) / 2, f), lerp(rh[1], (rh[1] + lh[1]) / 2, f))
-        s = b.scale
-        self.T = (QTransform().translate(self.P[0], self.P[1]).rotate(self.rot).scale(s * self.flip, s)
-                  .translate(-att[0], -att[1]))
-        if not self.rope_still:
-            d = math.hypot(self.P[0] - self.A[0], self.P[1] - self.A[1])
-            mv = self.rope.step(self.A, self.P, d * 1.015 + 2 * k, max(dt, 1 / 120), 2400 * k)
-            self.rope_still = mv < 0.03 and dt > 0
-        pose = self.pose
-        self.sig = (round(self.rot, 1), round(self.sleep_f, 2), self.rope_still, self.state,
-                    tuple(round(v, 1) for key in ("ra", "la", "rl", "ll") for v in pose[key]), b.costume_for(self.key)["key"])
-        self.animating = self.sig != self.prev_sig or not self.rope_still
-
-    def changed(self):
-        ch = self.sig != self.prev_sig or not self.rope_still
-        self.prev_sig = self.sig
-        return ch
-
-    def eyes(self):
-        return "sleep" if self.sleep_f > 0.5 else "open"
-
-    def box(self):
-        k = self.b.k
-        R = 115 * self.b.scale + 16
-        r = QRectF(self.P[0] - R, self.P[1] - R - 30 * k, 2 * R + 50 * k, 2 * R + 30 * k)
-        return r.united(QRectF(min(self.A[0], self.P[0]) - 20 * k, self.A[1] - 8, abs(self.A[0] - self.P[0]) + 40 * k,
-                               self.P[1] - self.A[1] + 20))
-
-    def rects(self):
-        return [self.box()]
-
-    def paint(self, p, now):
-        b = self.b
-        k = b.k
-        wl = max(1.0, k * 0.85)
-        draw_web_rope(p, self.rope.p, wl, cone=11 * k, phase=0.0)
-        c = b.costume_for(self.key)
-        p.save()
-        p.setTransform(self.T, True)
-        if self.animating:
-            draw_spider(p, c, self.pose, self.eyes(), "front", style=b.style, J=self.J)
-        else:                            # поза замерла — тело из кэша
-            dev = p.device()
-            dpr = dev.devicePixelRatioF() if dev is not None else 1.0
-            ck = (c["key"], self.eyes(), self.sig[4], round(b.scale * dpr, 3))
-            pm = self.cache.get(ck)
-            if pm is None:
-                if len(self.cache) > 4:
-                    self.cache.clear()
-                s2 = b.scale * dpr * 1.5
-                pm = QPixmap(int(self.BOX.width() * s2) + 2, int(self.BOX.height() * s2) + 2)
-                pm.fill(Qt.transparent)
-                q = QPainter(pm)
-                q.setRenderHint(QPainter.Antialiasing)
-                q.scale(s2, s2)
-                q.translate(-self.BOX.x(), -self.BOX.y())
-                draw_spider(q, c, self.pose, self.eyes(), "front", style=b.style, J=self.J)
-                q.end()
-                self.cache[ck] = pm
-            p.setRenderHint(QPainter.SmoothPixmapTransform)
-            p.drawPixmap(self.BOX, pm, QRectF(pm.rect()))
-        p.restore()
-        if self.sleep_f > 0.95:
-            hw = self.T.map(QPointF(0, 29))
-            b.font.setPixelSize(max(6, int(12 * k)))
-            p.setFont(b.font)
-            for i in range(3):
-                x, y = hw.x() + (24 + 12 * i) * k, hw.y() - (6 + 16 * i) * k
-                p.setPen(QColor(0, 0, 0, 120))
-                p.drawText(QPointF(x + 1, y + 1), "z")
-                p.setPen(QColor(255, 255, 255, 255))
-                p.drawText(QPointF(x, y), "z")
-
-
-# ----------------------------------------------------------------------------- самотест
 class PMC(ctypes.Structure):
     _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
                 ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
@@ -2996,11 +2797,7 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
         b.key_fn = lambda vk_: keys.get(vk_, False)
         b.next_fly, b.fly_idle = 0.0, 1.5
         b.stroll_after, b.stroll_jitter, b.stroll_force_side = 1.0, 0.0, True
-        b.s["buddy"] = True
-        b.side = None
-        b.setup_side(time.perf_counter())           # напарник — на экране без (подменного) курсора
         F["screens"] = len(QGuiApplication.screens())
-        F["side_created"] = b.side is not None
 
         def now_():
             return time.perf_counter()
@@ -3089,32 +2886,23 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
                                            timer_active=b.timer.isActive())), b.toggle_hidden(), st_.update(hk2=now_())))
         once("hk2", lambda: "hk2" in st_ and now_() - st_["hk2"] > 0.4,
              lambda: (F["hotkey"].update(restored=(not b.s["hidden"]) and all(o.isVisible() for o in b.overlays)),
-                      st_.update(phase="swap" if b.side else "rest", swap_at=now_() + 0.3, rest_at=now_() + 3.5)))
-        # 6. обмен с напарником: курсор на его монитор — герой там, где был напарник, без перелёта
-        def swap_go():
-            sd = b.side
-            st_.update(side_P=list(sd.P), side_key=sd.key, hero_key=b.s["costume"], hero_P=list(b.P), swap_t=now_(),
-                       other=sd.screen, n_modes=len(b.mode_log))
-            c_ = sd.screen.geometry().center()
-            cursor["pos"] = (float(c_.x()), float(c_.y()))
-        once("sw1", lambda: st_.get("phase") == "swap" and now_() > st_["swap_at"], swap_go)
-
-        def swap_check():
-            sp = st_["side_P"]
-            modes = [m_[1] for m_ in list(b.mode_log)[st_["n_modes"]:]]
-            swp = getattr(b, "swap_P", b.P)
-            F["swap"] = dict(hero_on_other_screen=b.screen_at(*b.P) is st_["other"],
-                             hero_at_side_pos=math.hypot(swp[0] - sp[0], swp[1] - sp[1]) < 2,
-                             costume_follows_body=b.s["costume"] == st_["side_key"] and b.side.key == st_["hero_key"],
-                             side_at_old_hero_pos=b.side is not None and math.hypot(b.side.P[0] - st_["hero_P"][0], b.side.P[1] - st_["hero_P"][1]) < 2,
-                             modes_after=modes, no_flight=not any(m_.startswith("air") or m_ == "swing" for m_ in modes))
-            shot("f8_обмен_мониторов.png", True)
-            cursor["pos"] = (x0, y0)
-            st_["back_t"] = now_()
-        once("sw2", lambda: "swap_t" in st_ and now_() - st_["swap_t"] > 0.6, swap_check)
-        once("sw3", lambda: "back_t" in st_ and now_() - st_["back_t"] > 0.6,
-             lambda: (F["swap"].update(back_on_primary=b.screen_at(*b.P) is scr, back_costume=b.s["costume"] == st_["hero_key"]),
-                      st_.update(phase="rest", rest_at=now_() + 3.5)))
+                      st_.update(phase="copy", copy_at=now_() + 0.3)))
+        # 6. Ctrl+C — двойник («копия») спускается на паутине рядом, игра, уходит
+        once("c1", lambda: st_.get("phase") == "copy" and now_() > st_["copy_at"] and b.mode == "hang",
+             lambda: (keys.update({0x11: True, 0x43: True}), st_.update(kc=now_())))
+        once("c2", lambda: "kc" in st_ and now_() - st_["kc"] > 0.3,
+             lambda: (keys.update({0x11: False, 0x43: False}),
+                      F.update(ctrl_c=dict(double=b.double is not None, key=b.double and b.double["key"],
+                                           phase=b.double and b.double["phase"]))))
+        once("c3", lambda: b.double and b.double["phase"] == "in" and now_() - b.double["t0"] > DESCENT * 0.5,
+             lambda: shot("f8_ctrl_c_спуск.png", True))
+        once("c4", lambda: b.double and b.double["phase"] == "act" and now_() - b.double["t_act"] > 1.2,
+             lambda: (shot("f8b_ctrl_c_двойник.png", True),
+                      F["ctrl_c"].update(act=b.double["act"], hero_pose=b.pose["hr"] + "/" + b.pose["hl"],
+                                         descent_s=round(b.double["t_act"] - b.double["t0"], 2)),
+                      st_.update(copy_wait=now_())))
+        once("c5", lambda: "copy_wait" in st_ and b.double is None,
+             lambda: (F["ctrl_c"].update(gone=True), st_.update(phase="rest", rest_at=now_() + 5.0)))
         # 7. покой: висит у курсора, окна нет — ноль перерисовок
         def rest_go():
             k_ = b.k
@@ -3159,7 +2947,6 @@ def main():
     overrides = {}
     if selftest:
         overrides["sleep"] = "--sleep" in argv      # обычный самотест — без сна (уводит паука с окна)
-        overrides["buddy"] = False                  # напарника включает только тест --features (после подмены курсора)
     if "--noir" in argv:
         overrides["noir_mode"] = True
     if "--size" in argv:
