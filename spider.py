@@ -81,6 +81,7 @@ DOUBLE_ENABLED = False    # двойник раз в 5 минут убран (05
 DESCENT = 2.4             # с: гости (мем, гитарист) медленно спускаются на паутине, держась за неё рукой
 NOIR_BAND_AFTER = 1.0     # режим Noir: через сколько секунд сидения прилетает гитарист; номер идёт, пока не прервут
 SONG_LINE_EVERY = 6.5     # с: смена фразы песни в облачке
+AIM_TIME = 0.8            # с: после клика-выстрела левая рука указывает на точку, нить тянется из ладони
 LONG_PRESS = 0.6          # с: долгое нажатие — паутина цепляется за точку нажатия, паук летит к ней
 FLY_EVERY = (120, 240)    # с: муха у курсора — не чаще раза в 2–4 минуты
 FLY_IDLE = (2.0, 3.0)     # с покоя у курсора, после которых прилетает муха
@@ -463,6 +464,7 @@ class Buddy:
         self.meme_shown = False
         self.meme_started_idle = None
         self.splats = []
+        self.aim = None                  # клик-выстрел: точка и срок, пока левая рука указывает на неё
         self.mouse_down = False
         self.T = QTransform()
         self.pose = get_pose("hang", self.style)
@@ -498,6 +500,7 @@ class Buddy:
         self.react = None                # реакция на Ctrl+S / Ctrl+Z: dict(pose, until)
         self.next_react = 0.0
         self.keys_prev = {}
+        self.copy_at = None              # момент Ctrl+C: двойника зовём, когда паук висит или сидит (до 3 с)
         self.fs_hidden = set()           # индексы оверлеев, спрятанных под полноэкранным окном
         self.last_fs_check = 0.0
         self.side = None                 # напарника на втором мониторе больше нет (06.11); поле — для совместимости
@@ -666,6 +669,25 @@ class Buddy:
 
     def hand_world(self):
         return self.world(self.J["rh"])
+
+    def aim_arm(self, now):
+        """Левая рука прямая, указательный палец — на точку выстрела (в координатах тела через обратное T).
+        Угол кости: 0° — вниз, положительный — наружу (art._dir с sx=-1 для левой стороны)."""
+        inv, ok = self.T.inverted()
+        if not ok:
+            return
+        lp = inv.map(QPointF(*self.aim["pt"]))
+        sh = self.J["ls"]
+        dx, dy = lp.x() - sh[0], lp.y() - sh[1]
+        if abs(dx) + abs(dy) < 1e-3:
+            return
+        a = math.degrees(math.atan2(-dx, dy))         # sx=-1 у левой руки
+        self.pose["la"] = (a, a)
+        self.pose["hl"] = "point"
+        self.pose["lafs"] = 1.0
+        self.pose["front"] = (self.pose.get("front") or "") .replace("l", "") + "l"
+        if self.mode == "hang" and abs(self.aim["pt"][0] - self.P[0]) > 12 * self.k:
+            self.flip_target = sign(self.aim["pt"][0] - self.P[0])
 
     def set_mode(self, mode):
         if mode != self.mode:
@@ -1072,15 +1094,14 @@ class Buddy:
 
     # --- двойник
     def start_double(self, now, force=False):
-        if self.double or self.meme or (not force and self.mode != "hang"):
-            return False
-        if self.mode != "hang":           # из меню — паук сначала повиснет, двойник подождёт
-            self.next_double = now + 3
+        """Двойник рядом с героем: в висе — со стороны центра экрана (герой повернётся к нему), сидя — со стороны
+        свободной (левой) руки, герой не поворачивается."""
+        if self.double or self.meme or self.mode not in ("hang", "sit"):
             return False
         k = self.k
         scr = self.screen_at(*self.P) or QGuiApplication.primaryScreen()
         g = scr.geometry()
-        side = 1.0 if self.P[0] < g.center().x() else -1.0
+        side = -self.flip if self.mode == "sit" else (1.0 if self.P[0] < g.center().x() else -1.0)
         mine = self.costume["key"]
         key = random.choice([c["key"] for c in COSTUMES if c["key"] != mine])
         act = ("five", "pillow")[self.double_i % 2]
@@ -1113,9 +1134,9 @@ class Buddy:
             if u >= 1:
                 d["phase"], d["t_act"] = "act", now
         elif d["phase"] == "act":
-            if self.mode != "hang" or now - d["t_act"] > 8.0:
+            if self.mode not in ("hang", "sit") or now - d["t_act"] > 8.0:
                 d["phase"], d["t_out"] = "out", now
-                if self.mode != "hang":
+                if self.mode not in ("hang", "sit"):
                     self.say("Bye-bye!", now)
         else:
             u = now - d["t_out"]
@@ -1522,6 +1543,13 @@ class Buddy:
                 self.log("pin: placed")
         self.mb_down = mb
         self.poll_keys(now)
+        if self.copy_at is not None:
+            if now - self.copy_at > 3.0:
+                self.copy_at = None
+            elif (self.mode in ("hang", "sit") and not self.meme and not self.double and not self.react
+                    and self.sleep_f == 0 and not self.dozing and not self.shooting and self.start_double(now, True)):
+                self.copy_at = None
+                self.log("react: C")
         self.update_react(now)
         self.update_fly(now, dt, cur, idle)
         self.check_fullscreen(now)
@@ -1540,8 +1568,10 @@ class Buddy:
             self.zip_to(now, pr["pos"])
         if not down and self.mouse_down and pr:
             if not pr["zip"] and self.s["clickweb"] and now - pr["t"] < LONG_PRESS:
-                hw = self.hand_world()           # короткий клик — выстрел паутиной в точку клика
+                hw = self.world(self.J["lh"])    # короткий клик — выстрел паутиной из свободной (левой) руки
                 self.splats.append([pr["pos"][0], pr["pos"][1], now, hw[0], hw[1]])
+                if self.mode in ("hang", "sit") and self.sleep_f == 0 and not self.dozing and not self.meme:
+                    self.aim = dict(pt=(pr["pos"][0], pr["pos"][1]), until=now + AIM_TIME)
             self.press = None
         self.mouse_down = down
         self.splats = [s for s in self.splats if now - s[2] < 1.6]
@@ -1834,9 +1864,7 @@ class Buddy:
             if not (down and not was):
                 continue
             if name == "C":
-                if (self.mode == "hang" and not self.meme and not self.double and not self.react
-                        and self.sleep_f == 0 and not self.dozing and self.start_double(now, True)):
-                    self.log("react: C")
+                self.copy_at = now
                 continue
             if (now >= self.next_react and self.mode in ("hang", "sit") and not self.meme
                     and not self.react and self.sleep_f == 0 and not self.dozing):
@@ -2040,12 +2068,16 @@ class Buddy:
             sw = math.sin(now * 3.0) * 14 * self.sit_sw
             target_pose["rl"] = (target_pose["rl"][0], target_pose["rl"][1] + sw)
             target_pose["ll"] = (target_pose["ll"][0], target_pose["ll"][1] - sw)
-            if self.react:
+            if self.double and self.double["phase"] == "act":
+                dp = self.hero_double_pose(now)
+                target_pose["la"], target_pose["hl"] = dp["la"], dp.get("hl", "open")
+                target_pose["front"] = "rl"
+            elif self.react:
                 rp = get_pose_safe(self.react["pose"], "sit", style)
                 target_pose["ra"], target_pose["la"] = rp["ra"], rp["la"]
                 target_pose["hr"], target_pose["hl"] = rp["hr"], rp["hl"]
                 target_pose["front"] = rp.get("front", "")
-            if coffee:
+            if coffee and not (self.double and self.double["phase"] == "act"):
                 target_pose["la"] = hang["la"]
                 target_pose["hl"] = "mug"
                 target_pose["lafs"] = hang.get("lafs", 1.0)
@@ -2098,6 +2130,10 @@ class Buddy:
             self.rot += wrap180(rot_t - self.rot) * min(1.0, dt * rate)
         self.flip += max(-dt * 9, min(dt * 9, self.flip_target - self.flip))
         self.pose = lerp_pose(self.pose, target_pose, min(1.0, dt * 14))
+        if self.aim and (now >= self.aim["until"] or mode not in ("hang", "sit") or self.sleep_f > 0):
+            self.aim = None
+        if self.aim:                     # рука на цель сразу (без сглаживания): нить выходит из ладони
+            self.aim_arm(now)
         self.J = fk(style, self.pose)
         com = self.st["com"]
         if mode in ("hang", "swing", "pin"):
@@ -2312,12 +2348,19 @@ class Buddy:
                 p.drawText(QPointF(x + 1, y + 1), "z")
                 p.setPen(QColor(255, 255, 255, int(255 * a)))
                 p.drawText(QPointF(x, y), "z")
-        for sx, sy, t0, px, py in self.splats:
+        for sp in self.splats:
+            sx, sy, t0, px, py = sp
             age = now - t0
+            if self.aim and self.aim["pt"] == (sx, sy):      # рука ещё указывает — нить из её ладони
+                px, py = self.world(self.J["lh"])
+                sp[3], sp[4] = px, py
             if age < 0.08:
                 tip = QPointF(lerp(px, sx, age / 0.08), lerp(py, sy, age / 0.08))
                 draw_web_line(p, QPointF(px, py), tip, 0.9)
             else:
+                if age < AIM_TIME:
+                    draw_web_line(p, QPointF(px, py), QPointF(sx, sy), 0.9,
+                                  alpha=int(255 * min(1.0, (AIM_TIME - age) / 0.25)), cone=8 * k)
                 r = 16 * k * min(1.0, (age - 0.08) / 0.12)
                 alpha = 1.0 - max(0.0, (age - 0.7) / 0.9)
                 draw_splat(p, sx, sy, r, alpha)
@@ -2844,7 +2887,19 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
         once("k4", lambda: "kz" in st_ and b.react and b.react["pose"] == "guilty" and now_() - st_["kz"] > 0.5,
              lambda: (shot("f6_ctrl_z.png", True), keys.update({0x11: False, 0x5A: False}),
                       F.update(ctrl_z=dict(bubble=b.bubble and b.bubble["text"])),
-                      st_.update(phase="pin", pin_at=now_() + 1.8)))
+                      st_.update(phase="copysit", kcs_at=now_() + 1.8)))
+        # 3б. Ctrl+C сидя — двойник приходит и к сидящему
+        once("cs1", lambda: st_.get("phase") == "copysit" and now_() > st_["kcs_at"] and not b.react,
+             lambda: (keys.update({0x11: True, 0x43: True}), st_.update(kcs=now_())))
+        once("cs2", lambda: "kcs" in st_ and now_() - st_["kcs"] > 0.3,
+             lambda: (keys.update({0x11: False, 0x43: False}),
+                      F.update(ctrl_c_sit=dict(mode=b.mode, double=b.double is not None))))
+        once("cs3", lambda: "kcs" in st_ and b.double and b.double["phase"] == "act" and now_() - b.double["t_act"] > 1.0,
+             lambda: (shot("f6b_ctrl_c_сидя.png", True),
+                      F["ctrl_c_sit"].update(act=b.double["act"], hero_mode=b.mode, hero_hl=b.pose["hl"],
+                                             side=b.double["side"], flip=b.flip)))
+        once("cs4", lambda: "kcs" in st_ and now_() - st_["kcs"] > 1.0 and b.double is None,
+             lambda: (F["ctrl_c_sit"].update(gone=True), st_.update(phase="pin", pin_at=now_() + 1.0)))
         # 4. булавка: средняя кнопка на пауке, тащим, отпускаем; курсор уходит — висит; клик — отпускает
         ptx, pty = x0 + 350, y0 - 300
 
@@ -2894,19 +2949,45 @@ def run_selftest(app, b, outdir, prefix="", sleep_demo=False, noir_demo=False, c
              lambda: (keys.update({0x11: False, 0x43: False}),
                       F.update(ctrl_c=dict(double=b.double is not None, key=b.double and b.double["key"],
                                            phase=b.double and b.double["phase"]))))
-        once("c3", lambda: b.double and b.double["phase"] == "in" and now_() - b.double["t0"] > DESCENT * 0.5,
+        once("c3", lambda: st_.get("phase") == "copy" and b.double and b.double["phase"] == "in" and now_() - b.double["t0"] > DESCENT * 0.5,
              lambda: shot("f8_ctrl_c_спуск.png", True))
-        once("c4", lambda: b.double and b.double["phase"] == "act" and now_() - b.double["t_act"] > 1.2,
+        once("c4", lambda: st_.get("phase") == "copy" and b.double and b.double["phase"] == "act" and now_() - b.double["t_act"] > 1.2,
              lambda: (shot("f8b_ctrl_c_двойник.png", True),
                       F["ctrl_c"].update(act=b.double["act"], hero_pose=b.pose["hr"] + "/" + b.pose["hl"],
                                          descent_s=round(b.double["t_act"] - b.double["t0"], 2)),
                       st_.update(copy_wait=now_())))
         once("c5", lambda: "copy_wait" in st_ and b.double is None,
-             lambda: (F["ctrl_c"].update(gone=True), st_.update(phase="rest", rest_at=now_() + 5.0)))
+             lambda: (F["ctrl_c"].update(gone=True), st_.update(phase="aim", aim_at=now_() + 1.0)))
+        # 6б. короткий клик в сторону: левая рука указывает на точку, нить выходит из ладони
+        def aim_go():                # клик там, где стоит курсор: паук уже подполз и повис рядом
+            st_["aim_pt"] = cursor["pos"]
+            btn["l"] = True
+            st_["aim_t"] = now_()
+        once("a0", lambda: st_.get("phase") == "aim" and now_() > st_["aim_at"],
+             lambda: (cursor.update(pos=(b.P[0] + 220, b.P[1] - 120)), st_.update(aim_go_at=now_() + 2.5)))
+        once("a1", lambda: "aim_go_at" in st_ and now_() > st_["aim_go_at"] and b.mode == "hang", aim_go)
+        once("a2", lambda: "aim_t" in st_ and now_() - st_["aim_t"] > 0.12, lambda: btn.update(l=False))
+
+        def aim_check():
+            lh = b.world(b.J["lh"])
+            pt = st_["aim_pt"]
+            sh = b.world(b.J["ls"])
+            ang_arm = math.degrees(math.atan2(lh[1] - sh[1], lh[0] - sh[0]))
+            ang_pt = math.degrees(math.atan2(pt[1] - sh[1], pt[0] - sh[0]))
+            sp = b.splats[-1] if b.splats else None
+            F["aim"] = dict(hl=b.pose["hl"], la=[round(v) for v in b.pose["la"]], aim=b.aim is not None,
+                            arm_vs_target_deg=round(abs(wrap180(ang_arm - ang_pt)), 1),
+                            thread_from_hand_px=round(math.hypot(sp[3] - lh[0], sp[4] - lh[1]), 1) if sp else None)
+            shot("f8c_выстрел_рука.png", True)
+            cursor["pos"] = (b.P[0] - 28 * b.k, b.P[1] - 14 * b.k)
+            st_.update(phase="rest", rest_at=now_() + 4.0)
+        once("a3", lambda: "aim_t" in st_ and now_() - st_["aim_t"] > 0.4, aim_check)
         # 7. покой: висит у курсора, окна нет — ноль перерисовок
         def rest_go():
             k_ = b.k
             win["r"] = (-10000, -10000, -9000, -9000)
+            b.s["windows"] = False       # иначе через 3 с простоя сядет «посреди экрана» и будет качать ногами
+            b.sit_target = None
             b.next_fly = 1e12
             cursor["pos"] = (b.P[0] - 28 * k_, b.P[1] - 14 * k_)
             st_["rest0"] = now_()
